@@ -66,6 +66,24 @@ function grammarForExtension(ext: string): string | null {
 let _initialized = false;
 let _parser: Parser | null = null;
 const _languages = new Map<string, Parser.Language>();
+// Per-grammar compiled candidate Query, or null if compilation failed (in
+// which case we permanently fall back to the baseline walker for that grammar).
+// Cache key matches `loadLanguage`'s grammar name.
+const _candidateQueries = new Map<string, Parser.Query | null>();
+// Test/diagnostic override: when true, every parseFile() call uses the
+// baseline walker even if the extractor has candidateNodeTypes. The parity
+// test in tests/query-parity.ts flips this to compare both paths on the same
+// fixtures. The env var SEER_USE_CANDIDATE_QUERY=0 has the same effect for
+// users who want to skip the query path system-wide (e.g. if a future
+// web-tree-sitter regression makes query.captures() expensive on their
+// workload).
+let _forceBaselineWalker =
+  typeof process !== 'undefined' &&
+  process.env &&
+  process.env.SEER_USE_CANDIDATE_QUERY === '0';
+export function setForceBaselineWalker(force: boolean): void {
+  _forceBaselineWalker = force;
+}
 
 async function ensureReady(): Promise<void> {
   if (_initialized) return;
@@ -123,6 +141,89 @@ async function resetWasmRuntime(): Promise<void> {
 /** How many times the WASM module had to be hard-reset. Exposed for stats. */
 export function wasmResetCount(): number {
   return _wasmResets;
+}
+
+/**
+ * Compile (and cache) the candidate-collection query for one grammar +
+ * extractor pair. Returns null if the extractor declares no candidate types
+ * OR if every type in the list was rejected by the grammar.
+ *
+ * Strategy:
+ *   1. Try the full combined query first (cheapest path).
+ *   2. If that throws — typically because one node type is unknown to the
+ *      grammar (e.g. `class_specifier` doesn't exist in tree-sitter-c) —
+ *      retry node types one at a time, keep only the ones that compile,
+ *      then build a final combined query from the survivors.
+ *   3. If even individual probes fail, cache null and the parser falls back
+ *      to the baseline walker for that grammar permanently.
+ *
+ * The query captures every candidate node under `@c` so the walker only has
+ * to check membership in a single Set; categorization is left to the
+ * extractor's `tryExtract*` callbacks (which retain all semantic authority).
+ */
+function getOrCompileCandidateQuery(
+  grammarName: string,
+  lang: Parser.Language,
+  candidateNodeTypes: readonly string[],
+): Parser.Query | null {
+  if (_candidateQueries.has(grammarName)) {
+    return _candidateQueries.get(grammarName) ?? null;
+  }
+  if (candidateNodeTypes.length === 0) {
+    _candidateQueries.set(grammarName, null);
+    return null;
+  }
+
+  const buildSource = (types: readonly string[]): string =>
+    types.map(t => `(${t}) @c`).join('\n');
+
+  // Pass 1: try the combined query.
+  try {
+    const q = lang.query(buildSource(candidateNodeTypes));
+    _candidateQueries.set(grammarName, q);
+    return q;
+  } catch { /* fall through to per-type probe */ }
+
+  // Pass 2: probe each type individually, keep only the survivors.
+  const survivors: string[] = [];
+  for (const t of candidateNodeTypes) {
+    try {
+      const probe = lang.query(`(${t}) @c`);
+      try { probe.delete(); } catch { /* */ }
+      survivors.push(t);
+    } catch { /* type not in this grammar; skip */ }
+  }
+  if (survivors.length === 0) {
+    _candidateQueries.set(grammarName, null);
+    return null;
+  }
+  try {
+    const q = lang.query(buildSource(survivors));
+    _candidateQueries.set(grammarName, q);
+    return q;
+  } catch {
+    _candidateQueries.set(grammarName, null);
+    return null;
+  }
+}
+
+/**
+ * Run the candidate query against a parsed tree and collect captured node
+ * ids into a Set. Returns null if the query fails at runtime — caller falls
+ * back to the baseline walker.
+ */
+function collectCandidateNodeIds(
+  query: Parser.Query,
+  rootNode: Parser.SyntaxNode,
+): Set<number> | null {
+  try {
+    const caps = query.captures(rootNode);
+    const ids = new Set<number>();
+    for (const c of caps) ids.add(c.node.id);
+    return ids;
+  } catch {
+    return null;
+  }
 }
 
 // ── Extractor registry ─────────────────────────────────────────────────────────
@@ -210,7 +311,23 @@ export async function parseFile(
     }
     const extractor = EXTRACTORS[language];
     try {
-      const result = walkTree(tree.rootNode, extractor);
+      // Query-assisted candidate collection: when the extractor declares its
+      // candidate node types we compile a Tree-Sitter Query for the grammar,
+      // gather candidate node ids in one pass, and pass them to the walker so
+      // it can skip the per-node tryExtract* calls on the vast majority of
+      // structural nodes (binary_expression, parenthesized_expression, etc.).
+      // If query compilation or evaluation fails for any reason we fall back
+      // to the baseline walker, which still produces correct results.
+      let candidateIds: Set<number> | null = null;
+      if (!_forceBaselineWalker && extractor.candidateNodeTypes && extractor.candidateNodeTypes.length > 0) {
+        const q = getOrCompileCandidateQuery(grammarName, lang, extractor.candidateNodeTypes);
+        if (q) {
+          candidateIds = collectCandidateNodeIds(q, tree.rootNode);
+        }
+      }
+      const result = candidateIds
+        ? walkTree(tree.rootNode, extractor, candidateIds)
+        : walkTree(tree.rootNode, extractor);
       noteParseSuccess();
       return result;
     } finally {

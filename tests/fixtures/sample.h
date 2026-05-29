@@ -1,4 +1,4 @@
-// Unreal-Engine-style header fixture for Strata smoke tests.
+// Unreal-Engine-style header fixture for Seer smoke tests.
 // Mimics the shape of an AActor subclass with UCLASS/UPROPERTY/UFUNCTION
 // macros (which tree-sitter-cpp tolerates as preprocessor noise).
 

@@ -1,4 +1,4 @@
-// React + JSX fixture for Strata smoke tests.
+// React + JSX fixture for Seer smoke tests.
 // Critically this file contains JSX, which the plain `typescript` grammar
 // cannot parse — it must be routed to the `tsx` grammar.
 

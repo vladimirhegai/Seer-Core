@@ -48,7 +48,7 @@ export function detectChanges(
     if (fileId === undefined) continue;
     const hunks = fileDiffHunksSync(repoRoot, abs, fromRef ?? undefined, toRef ?? undefined);
     if (hunks.length === 0) continue;
-    // Convert 1-indexed git line ranges to 0-indexed Strata line ranges.
+    // Convert 1-indexed git line ranges to 0-indexed Seer line ranges.
     const ranges: Array<[number, number]> = hunks.map(h => [
       Math.max(0, h.newStart - 1),
       Math.max(0, h.newStart - 1 + Math.max(0, h.newLines - 1)),

@@ -13,11 +13,23 @@ const GO_NESTING_NODES = new Set<string>([
   'type_switch_statement', 'select_statement',
 ]);
 
+const GO_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'function_declaration',
+  'method_declaration',
+  'type_declaration',
+  // tryExtractCallName
+  'call_expression',
+  // tryExtractImport
+  'import_spec',
+] as const;
+
 export const goExtractor: LanguageExtractor = {
   languageName: 'go',
   extensions: ['.go'],
   branchNodeTypes: GO_BRANCH_NODES,
   nestingNodeTypes: GO_NESTING_NODES,
+  candidateNodeTypes: GO_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

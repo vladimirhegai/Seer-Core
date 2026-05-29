@@ -6,39 +6,39 @@ import { z } from 'zod';
 import { Store } from '../db/store.js';
 import { Indexer } from '../indexer/index.js';
 import { jitSync } from '../indexer/freshness.js';
-import { StrataWatcher } from '../indexer/watcher.js';
+import { SeerWatcher } from '../indexer/watcher.js';
 import { buildArchitecture } from '../indexer/architecture.js';
 import { detectChanges } from '../indexer/detectchanges.js';
 import { collectChurn } from '../indexer/churn.js';
 import { buildSymbolHistory } from '../indexer/symbolhistory.js';
 
 /**
- * Strata MCP server.
+ * Seer MCP server.
  *
  * Tool surface (Track-B baseline + Track-C/D additions):
- *   - strata_health         freshness + schema state
- *   - strata_stats          counts (files/symbols/edges + role + Track-C totals)
- *   - strata_symbols        symbol search (BM25 / LIKE)
- *   - strata_definition     exact symbol definition lookup
- *   - strata_file_symbols   list symbols in a file
- *   - strata_callers        direct callers, bounded with true total
- *   - strata_callees        direct callees, bounded
- *   - strata_search         combined symbol + file path BM25 search,
+ *   - seer_health         freshness + schema state
+ *   - seer_stats          counts (files/symbols/edges + role + Track-C totals)
+ *   - seer_symbols        symbol search (BM25 / LIKE)
+ *   - seer_definition     exact symbol definition lookup
+ *   - seer_file_symbols   list symbols in a file
+ *   - seer_callers        direct callers, bounded with true total
+ *   - seer_callees        direct callees, bounded
+ *   - seer_search         combined symbol + file path BM25 search,
  *                           enriched with containing-symbol context
- *   - strata_reindex        explicit reindex
+ *   - seer_reindex        explicit reindex
  *
  *   v4 additions:
- *   - strata_routes         list HTTP routes detected in source
- *   - strata_dependencies   list external dependencies from manifests
- *   - strata_config         list config / env reads
- *   - strata_complexity     rank symbols by cyclomatic/cognitive complexity
- *   - strata_behavior       tests that exercise a given symbol
- *   - strata_trace_path     bounded BFS shortest call path A → B
- *   - strata_architecture   one-page codebase snapshot
- *   - strata_detect_changes blast-radius for current diff
- *   - strata_churn          file-level git churn pass (opt-in)
- *   - strata_history        per-symbol git history
- *   - strata_symbol_history (action) build symbol history index
+ *   - seer_routes         list HTTP routes detected in source
+ *   - seer_dependencies   list external dependencies from manifests
+ *   - seer_config         list config / env reads
+ *   - seer_complexity     rank symbols by cyclomatic/cognitive complexity
+ *   - seer_behavior       tests that exercise a given symbol
+ *   - seer_trace_path     bounded BFS shortest call path A → B
+ *   - seer_architecture   one-page codebase snapshot
+ *   - seer_detect_changes blast-radius for current diff
+ *   - seer_churn          file-level git churn pass (opt-in)
+ *   - seer_history        per-symbol git history
+ *   - seer_symbol_history (action) build symbol history index
  */
 
 export interface McpServerOptions {
@@ -48,10 +48,10 @@ export interface McpServerOptions {
   jit?: boolean;
 }
 
-export class StrataMcpServer {
+export class SeerMcpServer {
   private store!: Store;
   private indexer!: Indexer;
-  private watcher: StrataWatcher | null = null;
+  private watcher: SeerWatcher | null = null;
   private mcp: McpServer;
   private startedAt = Date.now();
   private workspace: string;
@@ -62,11 +62,11 @@ export class StrataMcpServer {
 
   constructor(options: McpServerOptions) {
     this.workspace = path.resolve(options.workspace);
-    this.dbPath = options.dbPath ?? path.join(this.workspace, '.strata', 'graph.db');
+    this.dbPath = options.dbPath ?? path.join(this.workspace, '.seer', 'graph.db');
     this.jitEnabled = options.jit ?? true;
     this.watchEnabled = options.watch ?? true;
 
-    this.mcp = new McpServer({ name: 'strata', version: '0.1.0' });
+    this.mcp = new McpServer({ name: 'seer', version: '0.1.0' });
     this.registerTools();
   }
 
@@ -79,13 +79,13 @@ export class StrataMcpServer {
 
     const stats = this.store.getStats();
     if (stats.files === 0) {
-      process.stderr.write(`[strata-mcp] empty index; running initial index...\n`);
+      process.stderr.write(`[seer-mcp] empty index; running initial index...\n`);
       const r = await this.indexer.indexDirectory(this.workspace, { quiet: true });
-      process.stderr.write(`[strata-mcp] initial index: ${r.filesIndexed} files, ${r.symbols} symbols, ${r.elapsedMs}ms\n`);
+      process.stderr.write(`[seer-mcp] initial index: ${r.filesIndexed} files, ${r.symbols} symbols, ${r.elapsedMs}ms\n`);
     }
 
     if (this.watchEnabled) {
-      this.watcher = new StrataWatcher(this.workspace, this.store, this.indexer, {
+      this.watcher = new SeerWatcher(this.workspace, this.store, this.indexer, {
         log: (m) => process.stderr.write(`[watcher] ${m}\n`),
       });
       this.watcher.start();
@@ -93,7 +93,7 @@ export class StrataMcpServer {
 
     const transport = new StdioServerTransport();
     await this.mcp.connect(transport);
-    process.stderr.write(`[strata-mcp] ready  workspace=${this.workspace}\n`);
+    process.stderr.write(`[seer-mcp] ready  workspace=${this.workspace}\n`);
   }
 
   async stop(): Promise<void> {
@@ -106,7 +106,7 @@ export class StrataMcpServer {
     if (this.jitPromise) { await this.jitPromise; return; }
     this.jitPromise = (async () => {
       try { await jitSync(this.store, this.indexer, this.workspace, { maxDirty: 200 }); }
-      catch (err) { process.stderr.write(`[strata-mcp] JIT failed: ${err}\n`); }
+      catch (err) { process.stderr.write(`[seer-mcp] JIT failed: ${err}\n`); }
       finally { this.jitPromise = null; }
     })();
     await this.jitPromise;
@@ -117,7 +117,7 @@ export class StrataMcpServer {
   }
 
   private registerTools(): void {
-    this.mcp.registerTool('strata_health', {
+    this.mcp.registerTool('seer_health', {
       description: 'Server health, schema, file/symbol counts, watcher status. Cheap; no JIT.',
       inputSchema: {},
     }, async () => {
@@ -142,7 +142,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_stats', {
+    this.mcp.registerTool('seer_stats', {
       description: 'Index statistics: counts, languages, roles, routes, deps, config keys. Runs JIT.',
       inputSchema: {},
     }, async () => {
@@ -150,18 +150,27 @@ export class StrataMcpServer {
       return this.text(this.store.getStats());
     });
 
-    this.mcp.registerTool('strata_symbols', {
-      description: 'Search symbols by name (BM25 over name/qualified_name/signature with camelCase/snake_case split). Returns top by PageRank when query omitted.',
+    this.mcp.registerTool('seer_symbols', {
+      description: 'Search symbols by name (BM25 over name/qualified_name/signature with camelCase/snake_case split). Returns top by PageRank when query omitted. Excludes vendor/generated/test/declaration rows by default; pass include* to widen.',
       inputSchema: {
         query: z.string().optional(),
         top: z.number().int().positive().max(500).optional(),
         limit: z.number().int().positive().max(500).optional(),
         includeVendor: z.boolean().optional(),
         includeGenerated: z.boolean().optional(),
+        includeTests: z.boolean().optional(),
+        includeDeclarations: z.boolean().optional(),
+        includeTypeRefs: z.boolean().optional(),
       },
-    }, async ({ query, top, limit, includeVendor, includeGenerated }) => {
+    }, async ({ query, top, limit, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs }) => {
       await this.ensureFresh();
-      const opts = { includeVendor: includeVendor ?? false, includeGenerated: includeGenerated ?? false };
+      const opts = {
+        includeVendor: includeVendor ?? false,
+        includeGenerated: includeGenerated ?? false,
+        includeTests: includeTests ?? false,
+        includeDeclarations: includeDeclarations ?? false,
+        includeTypeRefs: includeTypeRefs ?? false,
+      };
       let rows;
       let total: number | null = null;
       if (query) {
@@ -177,25 +186,32 @@ export class StrataMcpServer {
           file: r.filePath, lineStart: r.lineStart, lineEnd: r.lineEnd,
           pagerank: r.pagerank, signature: r.signature,
           loc: r.loc, cyclomatic: r.cyclomatic, cognitive: r.cognitive,
+          symbolRole: r.symbolRole,
         })),
         source: 'tree-sitter',
       });
     });
 
-    this.mcp.registerTool('strata_definition', {
-      description: 'Look up an exact symbol by name or qualified name.',
+    this.mcp.registerTool('seer_definition', {
+      description: 'Look up an exact symbol by name or qualified name. Excludes vendor/generated/test/declaration rows by default; pass include* to widen.',
       inputSchema: {
         name: z.string(),
         file: z.string().optional(),
         includeVendor: z.boolean().optional(),
         includeGenerated: z.boolean().optional(),
+        includeTests: z.boolean().optional(),
+        includeDeclarations: z.boolean().optional(),
+        includeTypeRefs: z.boolean().optional(),
       },
-    }, async ({ name, file, includeVendor, includeGenerated }) => {
+    }, async ({ name, file, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs }) => {
       await this.ensureFresh();
       const rows = this.store.getDefinition(name, {
         filePath: file,
         includeVendor: includeVendor ?? false,
         includeGenerated: includeGenerated ?? false,
+        includeTests: includeTests ?? false,
+        includeDeclarations: includeDeclarations ?? false,
+        includeTypeRefs: includeTypeRefs ?? false,
       });
       return this.text({
         total: rows.length,
@@ -204,12 +220,13 @@ export class StrataMcpServer {
           file: r.filePath, lineStart: r.lineStart, lineEnd: r.lineEnd,
           pagerank: r.pagerank, signature: r.signature,
           loc: r.loc, cyclomatic: r.cyclomatic, cognitive: r.cognitive,
+          symbolRole: r.symbolRole,
         })),
         source: 'tree-sitter',
       });
     });
 
-    this.mcp.registerTool('strata_file_symbols', {
+    this.mcp.registerTool('seer_file_symbols', {
       description: 'List symbols defined in a file (sorted by line).',
       inputSchema: {
         file: z.string(),
@@ -229,7 +246,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_callers', {
+    this.mcp.registerTool('seer_callers', {
       description: 'Direct callers of a symbol, bounded preview + true total.',
       inputSchema: {
         symbol: z.string(),
@@ -250,7 +267,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_callees', {
+    this.mcp.registerTool('seer_callees', {
       description: 'Direct callees of a symbol.',
       inputSchema: { symbol: z.string(), limit: z.number().int().positive().max(500).optional() },
     }, async ({ symbol, limit }) => {
@@ -270,21 +287,33 @@ export class StrataMcpServer {
 
     // Search: BM25 across symbols + files. Each symbol hit also gets enriched
     // with the containing symbol when the match is non-symbol (e.g. file).
-    this.mcp.registerTool('strata_search', {
-      description: 'Combined BM25 search across symbol names and file paths. Use this first; follow up with strata_definition / strata_file_symbols.',
+    this.mcp.registerTool('seer_search', {
+      description: 'Combined BM25 search across symbol names and file paths. Use this first; follow up with seer_definition / seer_file_symbols. Excludes vendor/generated/test/declaration rows by default.',
       inputSchema: {
         query: z.string().min(1),
         limit: z.number().int().positive().max(200).optional(),
         includeVendor: z.boolean().optional(),
         includeGenerated: z.boolean().optional(),
+        includeTests: z.boolean().optional(),
+        includeDeclarations: z.boolean().optional(),
+        includeTypeRefs: z.boolean().optional(),
       },
-    }, async ({ query, limit, includeVendor, includeGenerated }) => {
+    }, async ({ query, limit, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs }) => {
       await this.ensureFresh();
-      const opts = { includeVendor: includeVendor ?? false, includeGenerated: includeGenerated ?? false };
+      const opts = {
+        includeVendor: includeVendor ?? false,
+        includeGenerated: includeGenerated ?? false,
+        includeTests: includeTests ?? false,
+        includeDeclarations: includeDeclarations ?? false,
+        includeTypeRefs: includeTypeRefs ?? false,
+      };
       const symHits = this.store.searchSymbolsFts(query, { ...opts, limit: limit ?? 30 });
       const symbolTotal = this.store.countSymbols(query, opts);
-      const fileHits = this.store.searchFilesFts(query, limit ?? 30)
-        .filter(f => (includeVendor || f.role !== 'vendor') && (includeGenerated || f.role !== 'generated'));
+      const fileHits = this.store.searchFilesFts(query, limit ?? 30, {
+        includeVendor: opts.includeVendor,
+        includeGenerated: opts.includeGenerated,
+        includeTests: opts.includeTests,
+      });
       return this.text({
         query,
         symbolHits: {
@@ -292,7 +321,7 @@ export class StrataMcpServer {
           items: symHits.map(r => ({
             id: r.id, name: r.name, qualifiedName: r.qualifiedName,
             kind: r.kind, file: r.filePath, lineStart: r.lineStart,
-            pagerank: r.pagerank,
+            pagerank: r.pagerank, symbolRole: r.symbolRole,
           })),
         },
         fileHits: {
@@ -300,11 +329,11 @@ export class StrataMcpServer {
           items: fileHits.map(f => ({ path: f.path, relPath: f.relPath, language: f.language, role: f.role })),
         },
         source: 'tree-sitter',
-        note: 'Search-first: call strata_definition or strata_file_symbols on the chosen hit.',
+        note: 'Search-first: call seer_definition or seer_file_symbols on the chosen hit.',
       });
     });
 
-    this.mcp.registerTool('strata_reindex', {
+    this.mcp.registerTool('seer_reindex', {
       description: 'Reindex the workspace (incremental). Pass reset=true to wipe.',
       inputSchema: { reset: z.boolean().optional() },
     }, async ({ reset }) => {
@@ -317,7 +346,7 @@ export class StrataMcpServer {
         this.indexer = new Indexer(this.store);
         if (this.watcher) {
           await this.watcher.stop();
-          this.watcher = new StrataWatcher(this.workspace, this.store, this.indexer, {
+          this.watcher = new SeerWatcher(this.workspace, this.store, this.indexer, {
             log: (m) => process.stderr.write(`[watcher] ${m}\n`),
           });
           this.watcher.start();
@@ -339,7 +368,7 @@ export class StrataMcpServer {
 
     // ── Track-C tools ───────────────────────────────────────────────────────
 
-    this.mcp.registerTool('strata_routes', {
+    this.mcp.registerTool('seer_routes', {
       description: 'List HTTP routes detected in source (Express/Fastify/FastAPI/Flask/Spring).',
       inputSchema: {
         method: z.string().optional(),
@@ -358,7 +387,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_dependencies', {
+    this.mcp.registerTool('seer_dependencies', {
       description: 'List external dependencies declared in package manifests / lockfiles.',
       inputSchema: {
         ecosystem: z.string().optional(),
@@ -375,7 +404,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_config', {
+    this.mcp.registerTool('seer_config', {
       description: 'List static env/config reads detected in source (process.env, os.getenv, System.getenv).',
       inputSchema: {
         key: z.string().optional(),
@@ -392,24 +421,28 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_complexity', {
-      description: 'Rank functions/methods by complexity. Useful for risk-aware editing.',
+    this.mcp.registerTool('seer_complexity', {
+      description: 'Rank functions/methods by complexity. Useful for risk-aware editing. Excludes vendor/generated/test/declaration rows by default.',
       inputSchema: {
         by: z.enum(['cyclomatic', 'cognitive', 'loc', 'max_nesting']).optional(),
         minValue: z.number().int().nonnegative().optional(),
         limit: z.number().int().positive().max(500).optional(),
         includeVendor: z.boolean().optional(),
         includeGenerated: z.boolean().optional(),
+        includeTests: z.boolean().optional(),
+        includeDeclarations: z.boolean().optional(),
       },
-    }, async ({ by, minValue, limit, includeVendor, includeGenerated }) => {
+    }, async ({ by, minValue, limit, includeVendor, includeGenerated, includeTests, includeDeclarations }) => {
       await this.ensureFresh();
       const col = by ?? 'cyclomatic';
       const min = minValue ?? 1;
       const lim = limit ?? 50;
       const conds: string[] = [`s.${col} >= ?`];
       const args: unknown[] = [min];
-      if (!includeVendor)    conds.push('f.is_vendor = 0');
-      if (!includeGenerated) conds.push('f.is_generated = 0');
+      if (!includeVendor)       conds.push('f.is_vendor = 0');
+      if (!includeGenerated)    conds.push('f.is_generated = 0');
+      if (!includeTests)        conds.push(`f.role <> 'test'`);
+      if (!includeDeclarations) conds.push(`(s.symbol_role IS NULL OR s.symbol_role <> 'declaration')`);
       args.push(lim);
       const sql = `
         SELECT s.id, s.name, s.qualified_name AS qualifiedName, s.kind,
@@ -429,7 +462,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_behavior', {
+    this.mcp.registerTool('seer_behavior', {
       description: 'Tests that exercise a symbol (via synthesized "tests" edges from test files).',
       inputSchema: {
         symbol: z.string(),
@@ -456,7 +489,7 @@ export class StrataMcpServer {
       return this.text({ symbol, total: rows.length, items: rows });
     });
 
-    this.mcp.registerTool('strata_trace_path', {
+    this.mcp.registerTool('seer_trace_path', {
       description: 'Bounded BFS shortest call path from one symbol to another.',
       inputSchema: {
         from: z.string(),
@@ -479,7 +512,7 @@ export class StrataMcpServer {
       return this.text({ found: false, reason: `no path within depth ${maxDepth ?? 6}` });
     });
 
-    this.mcp.registerTool('strata_architecture', {
+    this.mcp.registerTool('seer_architecture', {
       description: 'One-page snapshot of the codebase: languages, modules, top symbols, entry points, hotspots, deps.',
       inputSchema: {},
     }, async () => {
@@ -487,7 +520,7 @@ export class StrataMcpServer {
       return this.text(buildArchitecture(this.workspace, this.store));
     });
 
-    this.mcp.registerTool('strata_detect_changes', {
+    this.mcp.registerTool('seer_detect_changes', {
       description: 'Compute blast-radius of an uncommitted (or between-refs) diff. Direct + transitive callers.',
       inputSchema: {
         fromRef: z.string().optional(),
@@ -499,7 +532,7 @@ export class StrataMcpServer {
       return this.text(detectChanges(this.workspace, this.store, { fromRef, toRef, callerDepth }));
     });
 
-    this.mcp.registerTool('strata_churn', {
+    this.mcp.registerTool('seer_churn', {
       description: 'Run a file-level git churn pass (commit counts, last commit, authors). Idempotent.',
       inputSchema: {},
     }, async () => {
@@ -508,7 +541,7 @@ export class StrataMcpServer {
 
     // ── Track-D tools ───────────────────────────────────────────────────────
 
-    this.mcp.registerTool('strata_history', {
+    this.mcp.registerTool('seer_history', {
       description: 'Per-symbol git history. Returns commits whose hunks overlap the symbol\'s line range.',
       inputSchema: {
         symbol: z.string(),
@@ -544,7 +577,7 @@ export class StrataMcpServer {
       });
     });
 
-    this.mcp.registerTool('strata_symbol_history_build', {
+    this.mcp.registerTool('seer_symbol_history_build', {
       description: 'Build (or refresh) the per-symbol git history index. Opt-in; can take minutes.',
       inputSchema: {
         maxCommitsPerFile: z.number().int().positive().max(2000).optional(),
@@ -561,7 +594,7 @@ export class StrataMcpServer {
 }
 
 export async function runMcp(options: McpServerOptions): Promise<void> {
-  const server = new StrataMcpServer(options);
+  const server = new SeerMcpServer(options);
   const shutdown = async (): Promise<void> => {
     try { await server.stop(); } catch { /* */ }
     process.exit(0);

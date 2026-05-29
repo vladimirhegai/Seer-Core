@@ -1,5 +1,5 @@
 /**
- * Strata Scale Test — exercises every large codebase under `Large Codebases/`,
+ * Seer Scale Test — exercises every large codebase under `Large Codebases/`,
  * runs each one twice (fresh + cached), and writes a robust report.
  *
  * Why this exists: after every foundational change (e.g. a future
@@ -338,7 +338,7 @@ function printSummary(reports: RunReport[]): void {
 
 function generateMarkdown(reports: RunReport[]): string {
   const ts = new Date().toISOString();
-  let md = `# Strata Scale-Test Results\n\n`;
+  let md = `# Seer Scale-Test Results\n\n`;
   md += `- Generated: ${ts}\n`;
   md += `- Node: ${process.version}\n`;
   md += `- Platform: ${process.platform}\n\n`;
@@ -433,7 +433,7 @@ async function main(): Promise<void> {
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(dbDir, { recursive: true });
 
-  console.log(`\nStrata Scale Test`);
+  console.log(`\nSeer Scale Test`);
   console.log(`─────────────────`);
   console.log(`Running ${toRun.length} codebase(s)\n`);
 

@@ -25,7 +25,7 @@ import { CURRENT_SCHEMA_VERSION } from '../src/db/schema';
 
 const ROOT = path.resolve(__dirname, '..');
 const FIXTURES = path.join(ROOT, 'tests/fixtures');
-const TMP_DB = path.join(os.tmpdir(), `strata-parallel-${Date.now()}.db`);
+const TMP_DB = path.join(os.tmpdir(), `seer-parallel-${Date.now()}.db`);
 
 let passed = 0;
 let failed = 0;
@@ -36,7 +36,7 @@ function bad(label: string, extra?: unknown): void {
 }
 
 async function main(): Promise<void> {
-  console.log('\nStrata Parallel-Read Test\n=========================\n');
+  console.log('\nSeer Parallel-Read Test\n=========================\n');
 
   // Seed the DB with an initial index.
   const writer = new Store(TMP_DB);

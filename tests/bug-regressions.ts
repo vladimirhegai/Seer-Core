@@ -1,7 +1,7 @@
 /**
- * Regression tests for the six bugs found and fixed during the 2026-05-29
- * audit. Each section reproduces the original failure mode against the fixed
- * code so a future regression in any of these areas trips immediately.
+ * Regression tests for the audit and scale bugs found after Track C/D.
+ * Each section reproduces the original failure mode against the fixed code
+ * so a future regression in any of these areas trips immediately.
  *
  * 1. v3→v4 migration leaves cached files without symbol_key + FTS rows
  * 2. churn-before-history makes buildSymbolHistory skip
@@ -9,6 +9,9 @@
  * 4. Symbol history drops author email
  * 5. File rename: --follow finds commits but diff lookup misses them
  * 6. Fastify object-style app.route({ method, url, handler }) not extracted
+ * 7. Large repos spend minutes in test-edge duplicate checks without a
+ *    composite edges(from_id, to_id, kind) index
+ * 8. Same-file edge resolution needs symbols(file_id, name) for Godot scale
  *
  * Run with: npx tsx tests/bug-regressions.ts
  */
@@ -56,7 +59,7 @@ function commit(repo: string, msg: string): string {
 // ── Bug 1: v3→v4 migration backfills symbol_key + FTS ──────────────────────
 async function bug1_v3MigrationBackfill(): Promise<void> {
   console.log('\n── Bug 1: v3→v4 migration backfills symbol_key + FTS rows ──');
-  const tmp = path.join(os.tmpdir(), `strata-bug1-${Date.now()}.db`);
+  const tmp = path.join(os.tmpdir(), `seer-bug1-${Date.now()}.db`);
   // Hand-build a "v3" DB: schema version 3, no v4 columns/tables/FTS.
   const db = new DatabaseSync(tmp);
   db.exec(`
@@ -101,7 +104,7 @@ async function bug1_v3MigrationBackfill(): Promise<void> {
   const ftsSyms = raw.prepare('SELECT COUNT(*) AS c FROM symbols_fts').get() as { c: number };
   const ftsFiles = raw.prepare('SELECT COUNT(*) AS c FROM files_fts').get() as { c: number };
 
-  assert(s.schemaInfo().dbVersion === 4, `schema migrated to v4 (got ${s.schemaInfo().dbVersion})`);
+  assert(s.schemaInfo().dbVersion === 5, `schema migrated to v5 (got ${s.schemaInfo().dbVersion})`);
   assert(nullKeys.c === 0, `symbol_key backfilled for every pre-v4 symbol (got ${nullKeys.c} NULL)`);
   assert(ftsSyms.c === 2, `symbols_fts rebuilt from existing symbols (got ${ftsSyms.c} rows, expected 2)`);
   assert(ftsFiles.c === 1, `files_fts rebuilt from existing files (got ${ftsFiles.c} rows, expected 1)`);
@@ -121,7 +124,7 @@ async function bug1_v3MigrationBackfill(): Promise<void> {
 // ── Bug 2: churn before history must not poison the history skip guard ────
 async function bug2_churnHistoryClash(): Promise<void> {
   console.log('\n── Bug 2: churn before history does NOT make history skip ──');
-  const tmp = path.join(os.tmpdir(), `strata-bug2-${Date.now()}`);
+  const tmp = path.join(os.tmpdir(), `seer-bug2-${Date.now()}`);
   const repo = path.join(tmp, 'repo');
   makeGitRepo(repo);
   fs.writeFileSync(path.join(repo, 'a.ts'), 'export function foo() { return 1; }\n');
@@ -161,7 +164,7 @@ async function bug2_churnHistoryClash(): Promise<void> {
 // ── Bug 3: Spring class-level @RequestMapping prefixes method routes ──────
 async function bug3_springClassPrefix(): Promise<void> {
   console.log('\n── Bug 3: Spring class-level @RequestMapping("/api") prefix ──');
-  const tmp = path.join(os.tmpdir(), `strata-bug3-${Date.now()}`);
+  const tmp = path.join(os.tmpdir(), `seer-bug3-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   fs.writeFileSync(path.join(tmp, 'A.java'), `
 package x;
@@ -215,7 +218,7 @@ class B {
 // ── Bug 4 + 5: rename history + author email ──────────────────────────────
 async function bug4and5_renameAndEmail(): Promise<void> {
   console.log('\n── Bugs 4 + 5: file rename + author email in symbol history ──');
-  const tmp = path.join(os.tmpdir(), `strata-bug45-${Date.now()}`);
+  const tmp = path.join(os.tmpdir(), `seer-bug45-${Date.now()}`);
   const repo = path.join(tmp, 'repo');
   makeGitRepo(repo);
 
@@ -306,7 +309,7 @@ function bug5_parseFollowLogEdgeCases(): void {
 // ── Bug 6: Fastify object-style routes ────────────────────────────────────
 async function bug6_fastifyObjectRoutes(): Promise<void> {
   console.log('\n── Bug 6: Fastify object-style app.route({ method, url, handler }) ──');
-  const tmp = path.join(os.tmpdir(), `strata-bug6-${Date.now()}`);
+  const tmp = path.join(os.tmpdir(), `seer-bug6-${Date.now()}`);
   fs.mkdirSync(tmp, { recursive: true });
   fs.copyFileSync(
     path.join(__dirname, 'fixtures-trackcd', 'fastify_object_routes.js'),
@@ -354,16 +357,98 @@ fastify.route({ method: 'GET', url: url, handler: doStuff });
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
+// ── Bug 7: test-edge duplicate check needs a composite edge index ───────────
+function bug7_testEdgeDuplicateIndex(): void {
+  console.log('\n── Bug 7: test-edge duplicate check uses composite edge index ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug7-${Date.now()}.db`);
+  const store = new Store(tmp);
+  const raw = store.rawDb();
+
+  const indexCols = raw.prepare(`PRAGMA index_info(idx_edges_from_to_kind)`).all() as Array<{ name: string }>;
+  const colNames = indexCols.map(c => c.name).join(',');
+  assert(colNames === 'from_id,to_id,kind',
+    `idx_edges_from_to_kind columns are from_id,to_id,kind (got ${colNames})`);
+
+  const plan = raw.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT e.from_id, e.to_id, e.to_name, e.line
+    FROM edges e
+    JOIN symbols s ON s.id = e.from_id
+    JOIN files fs ON fs.id = s.file_id
+    JOIN symbols t ON t.id = e.to_id
+    JOIN files ft ON ft.id = t.file_id
+    WHERE e.kind = 'call'
+      AND fs.role = 'test'
+      AND ft.role <> 'test'
+      AND NOT EXISTS (
+        SELECT 1 FROM edges e2
+        WHERE e2.from_id = e.from_id
+          AND e2.to_id = e.to_id
+          AND e2.kind = 'tests'
+      )
+  `).all() as Array<{ detail: string }>;
+
+  const details = plan.map(p => p.detail).join(' | ');
+  assert(details.includes('idx_edges_from_to_kind') && details.includes('from_id=?') && details.includes('to_id=?') && details.includes('kind=?'),
+    `duplicate check probes idx_edges_from_to_kind (plan: ${details})`);
+
+  store.close();
+  fs.unlinkSync(tmp);
+}
+
+// ── Bug 8: same-file edge resolution needs a composite symbol lookup index ──
+function bug8_sameFileResolutionIndex(): void {
+  console.log('\n── Bug 8: same-file edge resolution uses symbols(file_id, name) index ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug8-${Date.now()}.db`);
+  const store = new Store(tmp);
+  const raw = store.rawDb();
+
+  const indexCols = raw.prepare(`PRAGMA index_info(idx_symbols_file_name)`).all() as Array<{ name: string }>;
+  const colNames = indexCols.map(c => c.name).join(',');
+  assert(colNames === 'file_id,name',
+    `idx_symbols_file_name columns are file_id,name (got ${colNames})`);
+
+  const plan = raw.prepare(`
+    EXPLAIN QUERY PLAN
+    UPDATE edges
+    SET to_id = (
+      SELECT t.id
+      FROM symbols t, symbols s
+      WHERE s.id = edges.from_id
+        AND t.name = edges.to_name
+        AND t.file_id = s.file_id
+      LIMIT 1
+    )
+    WHERE to_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM symbols t, symbols s
+        WHERE s.id = edges.from_id
+          AND t.name = edges.to_name
+          AND t.file_id = s.file_id
+      );
+  `).all() as Array<{ detail: string }>;
+
+  const details = plan.map(p => p.detail).join(' | ');
+  assert(details.includes('idx_symbols_file_name') && details.includes('file_id=?') && details.includes('name=?'),
+    `same-file resolution probes idx_symbols_file_name (plan: ${details})`);
+
+  store.close();
+  fs.unlinkSync(tmp);
+}
+
 async function run(): Promise<void> {
-  console.log('\nStrata Bug-Regression Tests');
+  console.log('\nSeer Bug-Regression Tests');
   console.log('===========================');
-  console.log('Each section asserts a bug found during the 2026-05-29 audit stays fixed.');
+  console.log('Each section asserts an audit/scale bug stays fixed.');
   await bug1_v3MigrationBackfill();
   await bug2_churnHistoryClash();
   await bug3_springClassPrefix();
   await bug4and5_renameAndEmail();
   bug5_parseFollowLogEdgeCases();
   await bug6_fastifyObjectRoutes();
+  bug7_testEdgeDuplicateIndex();
+  bug8_sameFileResolutionIndex();
 
   console.log(`\n══════════════════════════════════════════════════════════════`);
   console.log(`  Regression results: ${passed} passed, ${failed} failed`);

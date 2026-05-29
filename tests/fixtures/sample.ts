@@ -1,4 +1,4 @@
-// Sample TypeScript fixture for Strata smoke tests
+// Sample TypeScript fixture for Seer smoke tests
 
 interface User {
   id: string;

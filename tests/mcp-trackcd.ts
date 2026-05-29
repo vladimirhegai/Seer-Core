@@ -1,5 +1,5 @@
 /**
- * MCP smoke test for Track-C/D tools. Spawns `strata mcp` against the
+ * MCP smoke test for Track-C/D tools. Spawns `seer mcp` against the
  * fixtures-trackcd workspace and exercises every new tool over stdio.
  *
  * Run: npx tsx tests/mcp-trackcd.ts
@@ -12,7 +12,7 @@ import os from 'os';
 
 const ROOT = path.resolve(__dirname, '..');
 const FIX = path.join(ROOT, 'tests/fixtures-trackcd');
-const TMP_WS = path.join(os.tmpdir(), `strata-mcp-cd-${Date.now()}`);
+const TMP_WS = path.join(os.tmpdir(), `seer-mcp-cd-${Date.now()}`);
 const CLI = path.join(ROOT, 'dist/cli/index.js');
 
 let passed = 0;
@@ -31,7 +31,7 @@ function copyRecursive(src: string, dst: string): void {
 }
 
 async function main(): Promise<void> {
-  console.log('\nStrata MCP Track-C/D Smoke\n==========================\n');
+  console.log('\nSeer MCP Track-C/D Smoke\n==========================\n');
   copyRecursive(FIX, TMP_WS);
   console.log(`  Workspace: ${TMP_WS}`);
 
@@ -86,10 +86,10 @@ async function main(): Promise<void> {
   const list = await call('tools/list', {});
   const names: string[] = (list.result?.tools ?? []).map((t: any) => t.name);
   const newTools = [
-    'strata_routes', 'strata_dependencies', 'strata_config',
-    'strata_complexity', 'strata_behavior', 'strata_trace_path',
-    'strata_architecture', 'strata_detect_changes', 'strata_churn',
-    'strata_history', 'strata_symbol_history_build',
+    'seer_routes', 'seer_dependencies', 'seer_config',
+    'seer_complexity', 'seer_behavior', 'seer_trace_path',
+    'seer_architecture', 'seer_detect_changes', 'seer_churn',
+    'seer_history', 'seer_symbol_history_build',
   ];
   for (const n of newTools) {
     if (names.includes(n)) ok(`tools/list advertises ${n}`);
@@ -101,61 +101,61 @@ async function main(): Promise<void> {
     return JSON.parse(r.result?.content?.[0]?.text ?? '{}');
   };
 
-  // strata_routes
-  const routes = await callTool('strata_routes', { limit: 100 });
-  if (routes.total >= 10) ok(`strata_routes total=${routes.total}`); else bad('strata_routes empty', routes);
-  if (routes.items?.some((r: any) => r.framework === 'fastapi')) ok('strata_routes includes fastapi'); else bad('no fastapi route', routes);
+  // seer_routes
+  const routes = await callTool('seer_routes', { limit: 100 });
+  if (routes.total >= 10) ok(`seer_routes total=${routes.total}`); else bad('seer_routes empty', routes);
+  if (routes.items?.some((r: any) => r.framework === 'fastapi')) ok('seer_routes includes fastapi'); else bad('no fastapi route', routes);
 
-  // strata_dependencies
-  const deps = await callTool('strata_dependencies', { limit: 100 });
-  if (deps.total >= 8) ok(`strata_dependencies total=${deps.total}`); else bad('strata_dependencies low', deps);
-  if (deps.items?.some((d: any) => d.name === 'express')) ok('strata_dependencies includes express'); else bad('no express dep', deps);
+  // seer_dependencies
+  const deps = await callTool('seer_dependencies', { limit: 100 });
+  if (deps.total >= 8) ok(`seer_dependencies total=${deps.total}`); else bad('seer_dependencies low', deps);
+  if (deps.items?.some((d: any) => d.name === 'express')) ok('seer_dependencies includes express'); else bad('no express dep', deps);
 
-  // strata_config
-  const cfg = await callTool('strata_config', { limit: 100 });
-  if (cfg.total >= 4) ok(`strata_config total=${cfg.total}`); else bad('strata_config low', cfg);
-  if (cfg.items?.some((c: any) => c.key === 'DATABASE_URL')) ok('strata_config has DATABASE_URL'); else bad('no DATABASE_URL', cfg);
+  // seer_config
+  const cfg = await callTool('seer_config', { limit: 100 });
+  if (cfg.total >= 4) ok(`seer_config total=${cfg.total}`); else bad('seer_config low', cfg);
+  if (cfg.items?.some((c: any) => c.key === 'DATABASE_URL')) ok('seer_config has DATABASE_URL'); else bad('no DATABASE_URL', cfg);
 
-  // strata_complexity
-  const cmpx = await callTool('strata_complexity', { by: 'cyclomatic', minValue: 3, limit: 20 });
-  if (cmpx.returned >= 1) ok(`strata_complexity returned=${cmpx.returned}`); else bad('strata_complexity empty', cmpx);
-  if (cmpx.items?.[0]?.cyclomatic >= 3) ok(`strata_complexity sorted desc (top=${cmpx.items[0].cyclomatic})`); else bad('sort wrong', cmpx);
+  // seer_complexity
+  const cmpx = await callTool('seer_complexity', { by: 'cyclomatic', minValue: 3, limit: 20 });
+  if (cmpx.returned >= 1) ok(`seer_complexity returned=${cmpx.returned}`); else bad('seer_complexity empty', cmpx);
+  if (cmpx.items?.[0]?.cyclomatic >= 3) ok(`seer_complexity sorted desc (top=${cmpx.items[0].cyclomatic})`); else bad('sort wrong', cmpx);
 
-  // strata_behavior — login is exercised by the test
-  const beh = await callTool('strata_behavior', { symbol: 'login' });
-  if (beh.total >= 1) ok(`strata_behavior(login) total=${beh.total}`); else bad('strata_behavior empty', beh);
+  // seer_behavior — login is exercised by the test
+  const beh = await callTool('seer_behavior', { symbol: 'login' });
+  if (beh.total >= 1) ok(`seer_behavior(login) total=${beh.total}`); else bad('seer_behavior empty', beh);
 
-  // strata_trace_path
-  const trace = await callTool('strata_trace_path', { from: 'login', to: 'validateCredentials' });
-  if (trace.found && trace.depth >= 1) ok(`strata_trace_path login → validateCredentials depth=${trace.depth}`);
-  else bad('strata_trace_path failed', trace);
+  // seer_trace_path
+  const trace = await callTool('seer_trace_path', { from: 'login', to: 'validateCredentials' });
+  if (trace.found && trace.depth >= 1) ok(`seer_trace_path login → validateCredentials depth=${trace.depth}`);
+  else bad('seer_trace_path failed', trace);
 
-  // strata_architecture
-  const arch = await callTool('strata_architecture', {});
-  if (arch.totals?.routes >= 10) ok(`strata_architecture routes=${arch.totals.routes}`); else bad('arch routes', arch.totals);
-  if (arch.languages?.length >= 3) ok(`strata_architecture languages=${arch.languages.length}`); else bad('arch langs', arch.languages);
+  // seer_architecture
+  const arch = await callTool('seer_architecture', {});
+  if (arch.totals?.routes >= 10) ok(`seer_architecture routes=${arch.totals.routes}`); else bad('arch routes', arch.totals);
+  if (arch.languages?.length >= 3) ok(`seer_architecture languages=${arch.languages.length}`); else bad('arch langs', arch.languages);
 
-  // strata_symbols with FTS (the new code path)
-  const sym = await callTool('strata_symbols', { query: 'validate', limit: 10 });
+  // seer_symbols with FTS (the new code path)
+  const sym = await callTool('seer_symbols', { query: 'validate', limit: 10 });
   if (sym.items?.some((s: any) => s.name === 'validateCredentials'))
-    ok('strata_symbols FTS finds validateCredentials by "validate" (camelCase split)');
-  else bad('strata_symbols FTS broken', sym);
+    ok('seer_symbols FTS finds validateCredentials by "validate" (camelCase split)');
+  else bad('seer_symbols FTS broken', sym);
 
-  // strata_search
-  const search = await callTool('strata_search', { query: 'auth' });
-  if (search.symbolHits?.returned >= 1) ok(`strata_search(auth) symbolHits=${search.symbolHits.returned}`);
-  else bad('strata_search empty', search);
+  // seer_search
+  const search = await callTool('seer_search', { query: 'auth' });
+  if (search.symbolHits?.returned >= 1) ok(`seer_search(auth) symbolHits=${search.symbolHits.returned}`);
+  else bad('seer_search empty', search);
 
-  // strata_churn — not a git repo, should return zero (cleanly)
-  const ch = await callTool('strata_churn', {});
-  if (typeof ch.elapsedMs === 'number') ok(`strata_churn returned ms=${ch.elapsedMs}`);
-  else bad('strata_churn broken', ch);
+  // seer_churn — not a git repo, should return zero (cleanly)
+  const ch = await callTool('seer_churn', {});
+  if (typeof ch.elapsedMs === 'number') ok(`seer_churn returned ms=${ch.elapsedMs}`);
+  else bad('seer_churn broken', ch);
 
-  // strata_health — should report routes, externalDeps, configKeys totals now
-  const health = await callTool('strata_health', {});
-  if (health.routes >= 10) ok(`strata_health routes=${health.routes}`); else bad('health routes', health);
-  if (health.externalDependencies >= 8) ok(`strata_health deps=${health.externalDependencies}`); else bad('health deps', health);
-  if (health.configKeys >= 4) ok(`strata_health configKeys=${health.configKeys}`); else bad('health configKeys', health);
+  // seer_health — should report routes, externalDeps, configKeys totals now
+  const health = await callTool('seer_health', {});
+  if (health.routes >= 10) ok(`seer_health routes=${health.routes}`); else bad('health routes', health);
+  if (health.externalDependencies >= 8) ok(`seer_health deps=${health.externalDependencies}`); else bad('health deps', health);
+  if (health.configKeys >= 4) ok(`seer_health configKeys=${health.configKeys}`); else bad('health configKeys', health);
 
   proc.stdin.end(); proc.kill();
   await new Promise(r => setTimeout(r, 200));

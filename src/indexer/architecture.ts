@@ -7,7 +7,7 @@ import { Store } from '../db/store.js';
  * hotspots, deps, top-N symbols.
  *
  * Pure read-side: never mutates the DB. Cheap enough to run on every
- * `strata_architecture` call (a few aggregate queries + some JS shaping).
+ * `seer_architecture` call (a few aggregate queries + some JS shaping).
  */
 
 export interface ArchitectureView {

@@ -13,11 +13,27 @@ const RUST_NESTING_NODES = new Set<string>([
   'loop_expression', 'match_expression',
 ]);
 
+const RUST_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'function_item',
+  'struct_item',
+  'enum_item',
+  'trait_item',
+  'type_item',
+  // tryExtractCallName
+  'call_expression',
+  // tryExtractImport
+  'use_declaration',
+  // tryExtractContextName — impl Foo { ... }
+  'impl_item',
+] as const;
+
 export const rustExtractor: LanguageExtractor = {
   languageName: 'rust',
   extensions: ['.rs'],
   branchNodeTypes: RUST_BRANCH_NODES,
   nestingNodeTypes: RUST_NESTING_NODES,
+  candidateNodeTypes: RUST_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

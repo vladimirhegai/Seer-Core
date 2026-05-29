@@ -20,7 +20,7 @@ function vendoredLooking(filePath: string): boolean {
 }
 
 async function main(): Promise<void> {
-  console.log('\nStrata DB Role Verification\n===========================\n');
+  console.log('\nSeer DB Role Verification\n===========================\n');
   for (const name of NAMES) {
     const dbPath = path.join(__dirname, 'outputs', 'dbs', `${name}.db`);
     if (!fs.existsSync(dbPath)) { console.log(`  ${name.padEnd(12)} (no DB)`); continue; }

@@ -9,7 +9,7 @@ import { Indexer } from '../src/indexer/index';
 import { Store } from '../src/db/store';
 
 const FIXTURES_DIR = path.join(__dirname, 'fixtures');
-const TMP_DB = path.join(os.tmpdir(), `strata-smoke-${Date.now()}.db`);
+const TMP_DB = path.join(os.tmpdir(), `seer-smoke-${Date.now()}.db`);
 
 let passed = 0;
 let failed = 0;
@@ -29,7 +29,7 @@ function assertGte(actual: number, min: number, label: string): void {
 }
 
 async function run(): Promise<void> {
-  console.log('\nStrata Smoke Test');
+  console.log('\nSeer Smoke Test');
   console.log('=================\n');
 
   const store = new Store(TMP_DB);

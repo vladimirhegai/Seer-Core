@@ -56,7 +56,7 @@ const GENERATED_FILENAME_PATTERNS = [
 
 // Test directories — exposed for completeness even though we don't yet use
 // the 'test' role to filter anywhere. Future work: surface test files in
-// `strata_behavior` as a behavioral contract.
+// `seer_behavior` as a behavioral contract.
 const TEST_DIR_PATTERNS = [
   /(^|[\\/])tests?[\\/]/i,
   /(^|[\\/])__tests__[\\/]/,

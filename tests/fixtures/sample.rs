@@ -1,4 +1,4 @@
-// Sample Rust fixture for Strata smoke tests
+// Sample Rust fixture for Seer smoke tests
 use std::collections::HashMap;
 
 pub trait Repository<T> {

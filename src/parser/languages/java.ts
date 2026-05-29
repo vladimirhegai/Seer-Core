@@ -21,11 +21,28 @@ const SPRING_REQUEST_ANNOTATIONS: Record<string, string> = {
   DeleteMapping: 'DELETE',
 };
 
+const JAVA_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'method_declaration',
+  'class_declaration',
+  'interface_declaration',
+  'constructor_declaration',
+  'enum_declaration',
+  // tryExtractCallName + tryExtractConfigKey
+  'method_invocation',
+  // tryExtractImport
+  'import_declaration',
+  // tryExtractRoute (Spring annotations on methods)
+  'annotation',
+  'marker_annotation',
+] as const;
+
 export const javaExtractor: LanguageExtractor = {
   languageName: 'java',
   extensions: ['.java'],
   branchNodeTypes: JAVA_BRANCH_NODES,
   nestingNodeTypes: JAVA_NESTING_NODES,
+  candidateNodeTypes: JAVA_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

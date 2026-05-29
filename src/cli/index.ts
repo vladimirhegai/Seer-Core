@@ -9,14 +9,14 @@ const VERSION = '0.1.0';
 
 function resolveDb(repoPath: string, customDb?: string): string {
   if (customDb) return path.resolve(customDb);
-  const strataDir = path.join(path.resolve(repoPath), '.strata');
-  if (!fs.existsSync(strataDir)) fs.mkdirSync(strataDir, { recursive: true });
-  return path.join(strataDir, 'graph.db');
+  const seerDir = path.join(path.resolve(repoPath), '.seer');
+  if (!fs.existsSync(seerDir)) fs.mkdirSync(seerDir, { recursive: true });
+  return path.join(seerDir, 'graph.db');
 }
 
 function openStore(dbPath: string, mutable = false): Store {
   if (!fs.existsSync(dbPath)) {
-    console.error(`No index found at ${dbPath}. Run "strata index <path>" first.`);
+    console.error(`No index found at ${dbPath}. Run "seer index <path>" first.`);
     process.exit(1);
   }
   return mutable ? new Store(dbPath) : Store.openReadOnly(dbPath);
@@ -27,16 +27,16 @@ function openStore(dbPath: string, mutable = false): Store {
 const program = new Command();
 
 program
-  .name('strata')
+  .name('seer')
   .description('Local-first AI codebase explainer')
   .version(VERSION);
 
-// ── strata index ───────────────────────────────────────────────────────────────
+// ── seer index ───────────────────────────────────────────────────────────────
 
 program
   .command('index <repo-path>')
   .description('Index a repository into a local SQLite graph')
-  .option('--db <path>', 'Custom database path (default: <repo>/.strata/graph.db)')
+  .option('--db <path>', 'Custom database path (default: <repo>/.seer/graph.db)')
   .option('-v, --verbose', 'Show per-file progress')
   .option('--reset', 'Delete existing index before re-indexing')
   .option('--max-file-kb <kb>', 'Skip files larger than this (KiB). 0 = no cap (default).', '0')
@@ -54,7 +54,7 @@ program
       fs.unlinkSync(dbPath);
       console.log(`  Removed existing index: ${dbPath}`);
     }
-    console.log(`\nStrata Index`);
+    console.log(`\nSeer Index`);
     console.log(`  Repo:  ${absRepo}`);
     console.log(`  DB:    ${dbPath}\n`);
     const store = new Store(dbPath);
@@ -91,13 +91,16 @@ program
     }
   });
 
-// ── strata callers / callees / symbols / stats / health ──────────────────────────
+// ── seer callers / callees / symbols / stats / health ──────────────────────────
 
 program
   .command('callers <symbol>')
   .description('Find all callers of a symbol')
   .option('--db <path>', 'Database path')
   .option('-n, --limit <n>', 'Max results', '40')
+  // Callers query is keyed by `edges.to_name`, not by symbol_role / vendor /
+  // test flags. The include-* options are accepted for surface consistency
+  // with the rest of the CLI but don't currently change results.
   .action((symbol: string, opts: { db?: string; limit: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
@@ -143,23 +146,36 @@ program
   .option('--db <path>', 'Database path')
   .option('--file <path>', 'Filter to symbols in a specific file')
   .option('-n, --top <n>', 'Show top N symbols by PageRank (default: 20)', '20')
-  .action((query: string | undefined, opts: { db?: string; file?: string; top: string }) => {
+  .option('--include-vendor',       'Include vendored code (off by default)')
+  .option('--include-generated',    'Include generated code (off by default)')
+  .option('--include-tests',        'Include symbols from test files (off by default)')
+  .option('--include-declarations', 'Include forward / class-body declarations (off by default)')
+  .option('--include-type-refs',    'Include bare type-reference rows (off by default; not yet emitted)')
+  .action((query: string | undefined, opts: { db?: string; file?: string; top: string; includeVendor?: boolean; includeGenerated?: boolean; includeTests?: boolean; includeDeclarations?: boolean; includeTypeRefs?: boolean }) => {
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
     try {
       const limit = parseInt(opts.top, 10);
+      const includeOpts = {
+        includeVendor: opts.includeVendor,
+        includeGenerated: opts.includeGenerated,
+        includeTests: opts.includeTests,
+        includeDeclarations: opts.includeDeclarations,
+        includeTypeRefs: opts.includeTypeRefs,
+      };
       let symbols;
       if (opts.file) { symbols = store.listSymbolsInFile(opts.file, limit); console.log(`\nSymbols in ${opts.file}\n`); }
-      else if (query) { symbols = store.findSymbols(query); console.log(`\nSymbols matching '${query}'\n`); }
-      else { symbols = store.getTopSymbols(limit); console.log(`\nTop ${limit} symbols by PageRank\n`); }
+      else if (query) { symbols = store.findSymbols(query, includeOpts); console.log(`\nSymbols matching '${query}'\n`); }
+      else { symbols = store.getTopSymbols(limit, includeOpts); console.log(`\nTop ${limit} symbols by PageRank\n`); }
       if (symbols.length === 0) { console.log('  (none found)'); return; }
-      console.log(`  ${'Name'.padEnd(32)} ${'Kind'.padEnd(12)} ${'Line'.padEnd(6)} ${'PageRank'.padEnd(10)} File`);
-      console.log('  ' + '─'.repeat(90));
+      console.log(`  ${'Name'.padEnd(32)} ${'Kind'.padEnd(12)} ${'Line'.padEnd(6)} ${'PageRank'.padEnd(10)} ${'Role'.padEnd(11)} File`);
+      console.log('  ' + '─'.repeat(102));
       for (const s of symbols) {
         const pr = s.pagerank.toFixed(4);
         const loc = String(s.lineStart + 1).padEnd(6);
         const relFile = s.filePath.replace(/\\/g, '/');
-        console.log(`  ${s.name.padEnd(32)} ${s.kind.padEnd(12)} ${loc} ${pr.padEnd(10)} ${relFile}`);
+        const role = (s.symbolRole ?? 'definition').padEnd(11);
+        console.log(`  ${s.name.padEnd(32)} ${s.kind.padEnd(12)} ${loc} ${pr.padEnd(10)} ${role} ${relFile}`);
       }
     } finally { store.close(); }
   });
@@ -173,7 +189,7 @@ program
     const store = openStore(dbPath);
     try {
       const stats = store.getStats();
-      console.log('\nStrata Index Stats');
+      console.log('\nSeer Index Stats');
       console.log('──────────────────');
       console.log(`  Files:           ${stats.files.toLocaleString()}`);
       console.log(`  Symbols:         ${stats.symbols.toLocaleString()}`);
@@ -193,7 +209,7 @@ program
 
 program
   .command('health')
-  .description('Show Strata index health')
+  .description('Show Seer index health')
   .option('--db <path>', 'Database path')
   .action((opts: { db?: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
@@ -201,12 +217,12 @@ program
     try {
       const schema = store.schemaInfo();
       const stats = store.getStats();
-      console.log('\nStrata Health');
+      console.log('\nSeer Health');
       console.log('─────────────');
       console.log(`  DB path:           ${dbPath}`);
       console.log(`  Read-only:         ${store.isReadOnly()}`);
       console.log(`  Schema version:    ${schema.dbVersion} (build expects ${schema.buildVersion})`);
-      if (!schema.current) console.log(`  ⚠  Schema is behind. Run \`strata index <path>\` to migrate.`);
+      if (!schema.current) console.log(`  ⚠  Schema is behind. Run \`seer index <path>\` to migrate.`);
       else                  console.log(`  ✓  Schema is up to date.`);
       console.log(`  Files:             ${stats.files.toLocaleString()}`);
       console.log(`  Symbols:           ${stats.symbols.toLocaleString()}`);
@@ -222,7 +238,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata routes ──────────────────────────────────────────────────────────────
+// ── seer routes ──────────────────────────────────────────────────────────────
 
 program
   .command('routes')
@@ -251,7 +267,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata deps ────────────────────────────────────────────────────────────────
+// ── seer deps ────────────────────────────────────────────────────────────────
 
 program
   .command('deps')
@@ -276,7 +292,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata config ──────────────────────────────────────────────────────────────
+// ── seer config ──────────────────────────────────────────────────────────────
 
 program
   .command('config')
@@ -297,7 +313,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata churn (file-level git churn pass) ──────────────────────────────────
+// ── seer churn (file-level git churn pass) ──────────────────────────────────
 
 program
   .command('churn')
@@ -316,11 +332,11 @@ program
     } finally { store.close(); }
   });
 
-// ── strata history (Track D) ──────────────────────────────────────────────────
+// ── seer history (Track D) ──────────────────────────────────────────────────
 
 program
   .command('history <symbol>')
-  .description('Show per-symbol commit history (requires `strata symbol-history` to have run)')
+  .description('Show per-symbol commit history (requires `seer symbol-history` to have run)')
   .option('--db <path>', 'Database path')
   .option('-n, --limit <n>', 'Max commits', '20')
   .action((symbol: string, opts: { db?: string; limit: string }) => {
@@ -334,7 +350,7 @@ program
         const history = store.getSymbolHistory(m.id, { limit });
         const total = store.countSymbolHistory(m.id);
         console.log(`\n${m.qualifiedName ?? m.name}  (${m.kind})  ${m.filePath}:${m.lineStart + 1}`);
-        if (history.length === 0) { console.log(`  (no history — run \`strata symbol-history\` first)`); continue; }
+        if (history.length === 0) { console.log(`  (no history — run \`seer symbol-history\` first)`); continue; }
         console.log(`  ${total} commits in history${total > history.length ? ` (showing ${history.length})` : ''}`);
         for (const h of history) {
           const date = new Date(h.committedAt * 1000).toISOString().slice(0, 10);
@@ -370,7 +386,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata architecture ──────────────────────────────────────────────────────
+// ── seer architecture ──────────────────────────────────────────────────────
 
 program
   .command('architecture')
@@ -399,7 +415,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata detect-changes ────────────────────────────────────────────────────
+// ── seer detect-changes ────────────────────────────────────────────────────
 
 program
   .command('detect-changes')
@@ -436,7 +452,7 @@ program
     } finally { store.close(); }
   });
 
-// ── strata mcp ─────────────────────────────────────────────────────────────────
+// ── seer mcp ─────────────────────────────────────────────────────────────────
 
 program
   .command('mcp')
@@ -470,13 +486,13 @@ function parseMode(input: string | undefined): 'full' | 'standard' | 'fast' | un
 function findDbFromCwd(): string {
   let dir = process.cwd();
   for (let i = 0; i < 6; i++) {
-    const candidate = path.join(dir, '.strata', 'graph.db');
+    const candidate = path.join(dir, '.seer', 'graph.db');
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-  console.error('Could not find .strata/graph.db. Run "strata index <path>" first.');
+  console.error('Could not find .seer/graph.db. Run "seer index <path>" first.');
   process.exit(1);
 }
 

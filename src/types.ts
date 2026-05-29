@@ -1,4 +1,4 @@
-// Core shared types for the Strata indexer
+// Core shared types for the Seer indexer
 
 export type Language =
   | 'python'
@@ -23,6 +23,22 @@ export type SymbolKind =
   | 'variable';
 
 export type EdgeKind = 'call' | 'import' | 'inherits' | 'implements' | 'tests';
+
+/**
+ * What variety of symbol this row represents.
+ *   - 'definition'  — the canonical, body-bearing definition site. The default
+ *                     and the only role indexed by every extractor on every
+ *                     symbol historically. Rankable when the kind allows it.
+ *   - 'declaration' — a forward declaration or prototype (no body). C/C++
+ *                     class-body method declarations and forward declarations
+ *                     fall here. Not rankable; excluded from agent-facing
+ *                     defaults unless `includeDeclarations=true`.
+ *   - 'type_ref'    — a bare use of a type name (no body, no declaration).
+ *                     Not yet emitted by any extractor — the slot exists so a
+ *                     future indexing mode can store reference sites without
+ *                     re-shaping the schema.
+ */
+export type SymbolRole = 'definition' | 'declaration' | 'type_ref';
 
 // A symbol definition extracted from source
 export interface SymbolDef {
@@ -50,6 +66,13 @@ export interface SymbolDef {
   cyclomatic?: number;
   cognitive?: number;
   maxNesting?: number;
+  /**
+   * Optional. When omitted, the Store treats this as `'definition'` —
+   * matches all pre-existing extractor behavior. C/C++ field_declaration
+   * (class-body method declarations) and forward declarations set this to
+   * `'declaration'` so default agent-facing queries can hide them.
+   */
+  symbolRole?: SymbolRole;
 }
 
 // A reference (call/usage) extracted from source
@@ -108,6 +131,11 @@ export interface SymbolRow {
   cyclomatic?: number | null;
   cognitive?: number | null;
   maxNesting?: number | null;
+  /**
+   * Stored variety of symbol. Null on pre-v5 DBs that haven't yet been
+   * re-indexed; the Store treats null as `'definition'` for filter logic.
+   */
+  symbolRole?: SymbolRole | null;
 }
 
 export interface CallerRow {

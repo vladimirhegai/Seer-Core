@@ -33,11 +33,36 @@ const CPP_NESTING_NODES = new Set<string>([
   'switch_statement', 'catch_clause', 'try_statement',
 ]);
 
+// Superset of every node type the C/C++ tryExtract* may accept. Some types
+// (`class_specifier`, `alias_declaration`, `namespace_definition`) exist only
+// in the C++ grammar; the parser's query compiler probes each type and drops
+// any that the grammar rejects, so this list is safe to share between the
+// `cpp` and `c` extractor instances.
+const CPP_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition (body-gated for struct/union/enum/class)
+  'function_definition',
+  'class_specifier',
+  'struct_specifier',
+  'union_specifier',
+  'enum_specifier',
+  'field_declaration',
+  'declaration',           // free-function prototypes / forward decls
+  'type_definition',
+  'alias_declaration',
+  // tryExtractCallName
+  'call_expression',
+  // tryExtractImport
+  'preproc_include',
+  // tryExtractContextName — namespace foo { ... } (C++ only)
+  'namespace_definition',
+] as const;
+
 export const cppExtractor: LanguageExtractor = {
   languageName: 'cpp',
   extensions: ['.cpp', '.cc', '.cxx', '.c++', '.hpp', '.hh', '.h++', '.h'],
   branchNodeTypes: CPP_BRANCH_NODES,
   nestingNodeTypes: CPP_NESTING_NODES,
+  candidateNodeTypes: CPP_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {
@@ -98,13 +123,38 @@ export const cppExtractor: LanguageExtractor = {
       // Methods declared (not defined) inside a class body. These are field
       // declarations whose declarator is a function_declarator — e.g.
       //   class Foo { void bar(); };  ← bar is a method declaration
-      // We extract it as a method symbol so it can be linked from elsewhere.
+      // We extract it as a method symbol so it can be linked from elsewhere,
+      // but tag it as `symbolRole='declaration'` so default agent-facing
+      // queries (top by rank, search) skip the declaration site in favour of
+      // the body-bearing `void Foo::bar() { ... }` definition that lives in
+      // the .cpp. Callers/callees still work because edges resolve by name.
       case 'field_declaration': {
         const declarator = node.childForFieldName('declarator');
         if (!declarator || declarator.type !== 'function_declarator') return null;
         const name = extractDeclaratorName(declarator);
         if (!name) return null;
-        return mkDef(name, 'method', node);
+        const def = mkDef(name, 'method', node);
+        def.symbolRole = 'declaration';
+        return def;
+      }
+
+      // Free-function prototypes / forward declarations at file scope, e.g.
+      //   void foo(int x);
+      //   extern int g_counter;          ← variable; we don't emit these
+      //   struct foo;                    ← struct forward-decl (handled below)
+      // tree-sitter-c/cpp parse these as `declaration` nodes whose declarator
+      // is a function_declarator. They're explicit declarations, not
+      // definitions; surface them with symbolRole='declaration' so callers
+      // who want to navigate to "where is this announced" can find them while
+      // default queries focus on the body-bearing definitions.
+      case 'declaration': {
+        const declarator = node.childForFieldName('declarator');
+        if (!declarator || declarator.type !== 'function_declarator') return null;
+        const name = extractDeclaratorName(declarator);
+        if (!name) return null;
+        const def = mkDef(name, 'function', node);
+        def.symbolRole = 'declaration';
+        return def;
       }
 
       // typedef int Foo;  or  using Foo = int;

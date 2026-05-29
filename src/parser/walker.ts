@@ -40,6 +40,23 @@ export interface LanguageExtractor {
    * "non-nesting" branches (logical operators, ternaries).
    */
   nestingNodeTypes?: ReadonlySet<string>;
+
+  /**
+   * Optional: list of tree-sitter node types that may produce a
+   * definition / call / import / route / config-key / context name on this
+   * extractor. Used by the parser to compile a Tree-Sitter Query that bulk-
+   * collects candidate nodes in one tree pass, so the walker can skip the
+   * `tryExtract*` calls on the ~95% of nodes that can never match anything.
+   *
+   * This is purely a performance optimization — the extractor's `tryExtract*`
+   * functions still own all semantic decisions (body gates, qualified-name
+   * resolution, overload disambiguation, route vs prefix, etc.). The list
+   * must be a SUPERSET of every node type any `tryExtract*` may accept;
+   * missing a type means whole categories of extracted things go silently
+   * unindexed. The fallback walker (`walkTree` with no candidate set) stays
+   * available for languages that omit this list or for diagnostics.
+   */
+  candidateNodeTypes?: readonly string[];
 }
 
 /**
@@ -51,10 +68,17 @@ export interface LanguageExtractor {
  *     complexity + max nesting depth + LOC by walking the def's subtree once.
  *   - Calls `tryExtractRoute` / `tryExtractConfigKey` per node and threads the
  *     results back through `FileExtraction.routes` / `.configKeys`.
+ *
+ * Optional `candidates` parameter: when provided, the walker only invokes the
+ * extractor's `tryExtract*` callbacks on nodes whose id is in the set. Tree
+ * structure is still fully traversed so the def-stack stays accurate; we just
+ * skip the per-node switch on non-candidates. Pass `undefined` (the default)
+ * to run as a full baseline walker.
  */
 export function walkTree(
   root: Parser.SyntaxNode,
   extractor: LanguageExtractor,
+  candidates?: ReadonlySet<number>,
 ): FileExtraction {
   const extraction: FileExtraction = {
     language: extractor.languageName as FileExtraction['language'],
@@ -85,8 +109,15 @@ export function walkTree(
     siblingCounts.pop();
   }
 
+  // When `candidates` is provided, only nodes whose id is in the set get
+  // their tryExtract* callbacks fired. Tree structure is still fully walked
+  // so the def-stack remains correct across non-candidate ancestors.
+  const useCandidates = candidates !== undefined;
+
   function walk(node: Parser.SyntaxNode): void {
-    const def = extractor.tryExtractDefinition(node);
+    const isCandidate = useCandidates ? candidates!.has(node.id) : true;
+
+    const def = isCandidate ? extractor.tryExtractDefinition(node) : null;
     if (def) {
       const disambig = pushName(def.name);
       def.qualifiedName =
@@ -116,7 +147,7 @@ export function walkTree(
       return;
     }
 
-    const ctxName = extractor.tryExtractContextName?.(node);
+    const ctxName = isCandidate ? extractor.tryExtractContextName?.(node) : null;
     if (ctxName) {
       defStack.push(ctxName);
       siblingCounts.push(new Map());
@@ -125,35 +156,37 @@ export function walkTree(
       return;
     }
 
-    // Routes are checked before calls because route registrations are
-    // themselves call expressions in JS frameworks (`app.get("/x", handler)`).
-    // Returning routes doesn't prevent the call from also being recorded —
-    // the route registration call is itself useful in the call graph.
-    const routes = extractor.tryExtractRoute?.(node);
-    if (routes && routes.length > 0) {
-      for (const r of routes) extraction.routes!.push(r);
-    }
+    if (isCandidate) {
+      // Routes are checked before calls because route registrations are
+      // themselves call expressions in JS frameworks (`app.get("/x", handler)`).
+      // Returning routes doesn't prevent the call from also being recorded —
+      // the route registration call is itself useful in the call graph.
+      const routes = extractor.tryExtractRoute?.(node);
+      if (routes && routes.length > 0) {
+        for (const r of routes) extraction.routes!.push(r);
+      }
 
-    const configKey = extractor.tryExtractConfigKey?.(node);
-    if (configKey) {
-      configKey.callerName = defStack.length > 0 ? defStack.join('.') : '';
-      extraction.configKeys!.push(configKey);
-    }
+      const configKey = extractor.tryExtractConfigKey?.(node);
+      if (configKey) {
+        configKey.callerName = defStack.length > 0 ? defStack.join('.') : '';
+        extraction.configKeys!.push(configKey);
+      }
 
-    const callee = extractor.tryExtractCallName(node);
-    if (callee) {
-      const callerName = defStack.length > 0 ? defStack.join('.') : '';
-      extraction.references.push({
-        calleeName: callee,
-        callerName,
-        kind: 'call',
-        line: node.startPosition.row,
-      });
-    }
+      const callee = extractor.tryExtractCallName(node);
+      if (callee) {
+        const callerName = defStack.length > 0 ? defStack.join('.') : '';
+        extraction.references.push({
+          calleeName: callee,
+          callerName,
+          kind: 'call',
+          line: node.startPosition.row,
+        });
+      }
 
-    const importPath = extractor.tryExtractImport(node);
-    if (importPath) {
-      extraction.importedModules.push(importPath);
+      const importPath = extractor.tryExtractImport(node);
+      if (importPath) {
+        extraction.importedModules.push(importPath);
+      }
     }
 
     for (const child of node.children) walk(child);

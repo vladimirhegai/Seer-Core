@@ -1,5 +1,5 @@
 /**
- * MCP smoke test: spawn `strata mcp` as a subprocess, drive it over stdio,
+ * MCP smoke test: spawn `seer mcp` as a subprocess, drive it over stdio,
  * and verify each tool call returns sane JSON. The test acts as a minimal
  * JSON-RPC 2.0 client.
  *
@@ -13,7 +13,7 @@ import os from 'os';
 
 const ROOT = path.resolve(__dirname, '..');
 const FIXTURES = path.join(ROOT, 'tests/fixtures');
-const TMP_WS = path.join(os.tmpdir(), `strata-mcp-ws-${Date.now()}`);
+const TMP_WS = path.join(os.tmpdir(), `seer-mcp-ws-${Date.now()}`);
 const CLI = path.join(ROOT, 'dist/cli/index.js');
 
 let passed = 0;
@@ -25,7 +25,7 @@ function bad(label: string, extra?: unknown): void {
 }
 
 async function main(): Promise<void> {
-  console.log('\nStrata MCP Smoke Test\n=====================\n');
+  console.log('\nSeer MCP Smoke Test\n=====================\n');
 
   // Build a tiny workspace from fixtures.
   fs.mkdirSync(TMP_WS, { recursive: true });
@@ -92,86 +92,86 @@ async function main(): Promise<void> {
   const list = await call('tools/list', {});
   const toolNames = (list.result?.tools ?? []).map((t: any) => t.name);
   const expected = [
-    'strata_health', 'strata_stats', 'strata_symbols', 'strata_definition',
-    'strata_file_symbols', 'strata_callers', 'strata_callees', 'strata_search', 'strata_reindex',
+    'seer_health', 'seer_stats', 'seer_symbols', 'seer_definition',
+    'seer_file_symbols', 'seer_callers', 'seer_callees', 'seer_search', 'seer_reindex',
   ];
   for (const e of expected) {
     if (toolNames.includes(e)) ok(`tools/list includes ${e}`);
     else bad(`tools/list missing ${e}`, toolNames);
   }
 
-  // strata_health
-  const health = await call('tools/call', { name: 'strata_health', arguments: {} });
+  // seer_health
+  const health = await call('tools/call', { name: 'seer_health', arguments: {} });
   const healthText = health.result?.content?.[0]?.text;
-  if (!healthText) { bad('strata_health returned no content'); }
+  if (!healthText) { bad('seer_health returned no content'); }
   else {
     const parsed = JSON.parse(healthText);
-    if (parsed.schemaCurrent === true) ok('strata_health reports current schema');
-    else bad('strata_health schema not current', parsed.schemaVersion);
-    if (parsed.files > 0 && parsed.symbols > 0) ok(`strata_health files=${parsed.files} symbols=${parsed.symbols}`);
-    else bad('strata_health empty index', parsed);
+    if (parsed.schemaCurrent === true) ok('seer_health reports current schema');
+    else bad('seer_health schema not current', parsed.schemaVersion);
+    if (parsed.files > 0 && parsed.symbols > 0) ok(`seer_health files=${parsed.files} symbols=${parsed.symbols}`);
+    else bad('seer_health empty index', parsed);
   }
 
-  // strata_symbols (top)
-  const top = await call('tools/call', { name: 'strata_symbols', arguments: { top: 5 } });
+  // seer_symbols (top)
+  const top = await call('tools/call', { name: 'seer_symbols', arguments: { top: 5 } });
   const topText = top.result?.content?.[0]?.text;
   const topParsed = topText ? JSON.parse(topText) : null;
   if (topParsed && Array.isArray(topParsed.items) && topParsed.items.length > 0) {
-    ok(`strata_symbols(top=5) returned ${topParsed.items.length} items`);
+    ok(`seer_symbols(top=5) returned ${topParsed.items.length} items`);
   } else {
-    bad('strata_symbols(top=5) returned empty', topParsed);
+    bad('seer_symbols(top=5) returned empty', topParsed);
   }
 
-  // strata_symbols (query)
-  const q = await call('tools/call', { name: 'strata_symbols', arguments: { query: 'AuthService' } });
+  // seer_symbols (query)
+  const q = await call('tools/call', { name: 'seer_symbols', arguments: { query: 'AuthService' } });
   const qParsed = JSON.parse(q.result?.content?.[0]?.text ?? '{}');
-  if (qParsed.items?.some((i: any) => i.name === 'AuthService')) ok('strata_symbols(query=AuthService) found it');
-  else bad('strata_symbols(query=AuthService) did not find it', qParsed);
+  if (qParsed.items?.some((i: any) => i.name === 'AuthService')) ok('seer_symbols(query=AuthService) found it');
+  else bad('seer_symbols(query=AuthService) did not find it', qParsed);
 
-  // strata_definition (exact)
-  const def = await call('tools/call', { name: 'strata_definition', arguments: { name: 'AuthService' } });
+  // seer_definition (exact)
+  const def = await call('tools/call', { name: 'seer_definition', arguments: { name: 'AuthService' } });
   const defParsed = JSON.parse(def.result?.content?.[0]?.text ?? '{}');
-  if (defParsed.items?.length >= 1) ok(`strata_definition(AuthService) returned ${defParsed.items.length}`);
-  else bad('strata_definition(AuthService) empty', defParsed);
+  if (defParsed.items?.length >= 1) ok(`seer_definition(AuthService) returned ${defParsed.items.length}`);
+  else bad('seer_definition(AuthService) empty', defParsed);
 
-  // strata_callers
-  const callers = await call('tools/call', { name: 'strata_callers', arguments: { symbol: 'AuthService' } });
+  // seer_callers
+  const callers = await call('tools/call', { name: 'seer_callers', arguments: { symbol: 'AuthService' } });
   const callersParsed = JSON.parse(callers.result?.content?.[0]?.text ?? '{}');
-  if (callersParsed.total >= 1) ok(`strata_callers(AuthService) total=${callersParsed.total}`);
-  else bad('strata_callers(AuthService) no callers', callersParsed);
+  if (callersParsed.total >= 1) ok(`seer_callers(AuthService) total=${callersParsed.total}`);
+  else bad('seer_callers(AuthService) no callers', callersParsed);
 
-  // strata_callees
-  const callees = await call('tools/call', { name: 'strata_callees', arguments: { symbol: 'process_payment' } });
+  // seer_callees
+  const callees = await call('tools/call', { name: 'seer_callees', arguments: { symbol: 'process_payment' } });
   const calleesParsed = JSON.parse(callees.result?.content?.[0]?.text ?? '{}');
-  if (calleesParsed.total >= 1) ok(`strata_callees(process_payment) total=${calleesParsed.total}`);
-  else bad('strata_callees(process_payment) no callees', calleesParsed);
+  if (calleesParsed.total >= 1) ok(`seer_callees(process_payment) total=${calleesParsed.total}`);
+  else bad('seer_callees(process_payment) no callees', calleesParsed);
 
-  // strata_file_symbols
+  // seer_file_symbols
   const fileSyms = await call('tools/call', {
-    name: 'strata_file_symbols',
+    name: 'seer_file_symbols',
     arguments: { file: 'sample.ts' },
   });
   const fsParsed = JSON.parse(fileSyms.result?.content?.[0]?.text ?? '{}');
-  if (fsParsed.total >= 1) ok(`strata_file_symbols(sample.ts) total=${fsParsed.total}`);
-  else bad('strata_file_symbols(sample.ts) empty', fsParsed);
+  if (fsParsed.total >= 1) ok(`seer_file_symbols(sample.ts) total=${fsParsed.total}`);
+  else bad('seer_file_symbols(sample.ts) empty', fsParsed);
 
-  // strata_search
-  const search = await call('tools/call', { name: 'strata_search', arguments: { query: 'auth' } });
+  // seer_search
+  const search = await call('tools/call', { name: 'seer_search', arguments: { query: 'auth' } });
   const sParsed = JSON.parse(search.result?.content?.[0]?.text ?? '{}');
-  if (sParsed.symbolHits?.returned >= 1) ok(`strata_search(auth) symbolHits=${sParsed.symbolHits.returned}`);
-  else bad('strata_search(auth) empty', sParsed);
+  if (sParsed.symbolHits?.returned >= 1) ok(`seer_search(auth) symbolHits=${sParsed.symbolHits.returned}`);
+  else bad('seer_search(auth) empty', sParsed);
 
-  // strata_reindex
-  const reindex = await call('tools/call', { name: 'strata_reindex', arguments: {} });
+  // seer_reindex
+  const reindex = await call('tools/call', { name: 'seer_reindex', arguments: {} });
   const rParsed = JSON.parse(reindex.result?.content?.[0]?.text ?? '{}');
-  if (typeof rParsed.elapsedMs === 'number') ok(`strata_reindex completed in ${rParsed.elapsedMs}ms`);
-  else bad('strata_reindex did not return elapsedMs', rParsed);
+  if (typeof rParsed.elapsedMs === 'number') ok(`seer_reindex completed in ${rParsed.elapsedMs}ms`);
+  else bad('seer_reindex did not return elapsedMs', rParsed);
 
-  // strata_stats
-  const stats = await call('tools/call', { name: 'strata_stats', arguments: {} });
+  // seer_stats
+  const stats = await call('tools/call', { name: 'seer_stats', arguments: {} });
   const statsParsed = JSON.parse(stats.result?.content?.[0]?.text ?? '{}');
-  if (statsParsed.files >= 5 && statsParsed.roles) ok(`strata_stats files=${statsParsed.files} role-aware`);
-  else bad('strata_stats missing role breakdown', statsParsed);
+  if (statsParsed.files >= 5 && statsParsed.roles) ok(`seer_stats files=${statsParsed.files} role-aware`);
+  else bad('seer_stats missing role breakdown', statsParsed);
 
   proc.stdin.end();
   proc.kill();

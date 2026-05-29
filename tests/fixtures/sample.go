@@ -1,4 +1,4 @@
-// Sample Go fixture for Strata smoke tests
+// Sample Go fixture for Seer smoke tests
 package main
 
 import "fmt"

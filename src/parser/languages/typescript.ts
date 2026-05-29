@@ -37,12 +37,36 @@ const HTTP_METHODS = new Set([
   'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'all', 'use',
 ]);
 
+// Union of every node type any tryExtract* on this extractor may accept.
+// Must be a strict superset; missing a type would silently drop whatever the
+// extractor would have emitted for it. The parser/index.ts compiles this into
+// a Tree-Sitter Query and only fires the per-node extract calls on captures.
+const TS_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'function_declaration',
+  'generator_function_declaration',
+  'class_declaration',
+  'method_definition',
+  'interface_declaration',
+  'type_alias_declaration',
+  'variable_declarator',
+  // tryExtractCallName + tryExtractImport + tryExtractRoute (all reuse call_expression)
+  'call_expression',
+  'new_expression',
+  // tryExtractImport (also)
+  'import_statement',
+  // tryExtractConfigKey
+  'member_expression',
+  'subscript_expression',
+] as const;
+
 // Handles .ts, .tsx, .js, .jsx via separate WASM grammars but shared extractor logic
 export const typescriptExtractor: LanguageExtractor = {
   languageName: 'typescript',
   extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'],
   branchNodeTypes: TS_BRANCH_NODES,
   nestingNodeTypes: TS_NESTING_NODES,
+  candidateNodeTypes: TS_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

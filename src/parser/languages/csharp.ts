@@ -21,11 +21,29 @@ const CS_NESTING_NODES = new Set<string>([
   'switch_statement', 'catch_clause', 'try_statement',
 ]);
 
+const CS_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'method_declaration',
+  'class_declaration',
+  'interface_declaration',
+  'struct_declaration',
+  'enum_declaration',
+  'constructor_declaration',
+  'record_declaration',
+  'delegate_declaration',
+  // tryExtractCallName (invocation + object_creation)
+  'invocation_expression',
+  'object_creation_expression',
+  // tryExtractImport
+  'using_directive',
+] as const;
+
 export const csharpExtractor: LanguageExtractor = {
   languageName: 'csharp',
   extensions: ['.cs'],
   branchNodeTypes: CS_BRANCH_NODES,
   nestingNodeTypes: CS_NESTING_NODES,
+  candidateNodeTypes: CS_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

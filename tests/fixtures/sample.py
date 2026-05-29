@@ -1,4 +1,4 @@
-"""Sample Python fixture for Strata smoke tests."""
+"""Sample Python fixture for Seer smoke tests."""
 
 
 class PaymentService:

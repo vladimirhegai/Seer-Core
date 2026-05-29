@@ -2,7 +2,7 @@
  * JIT-freshness MCP integration test.
  *
  * Procedure:
- *   1. Start `strata mcp --workspace <tmp>` with watcher off and JIT on.
+ *   1. Start `seer mcp --workspace <tmp>` with watcher off and JIT on.
  *   2. Verify a symbol from sample.ts is queryable (post initial index).
  *   3. Append a new function to sample.ts on disk (no calls in/out).
  *   4. Issue another query and verify JIT picked up the new symbol.
@@ -20,7 +20,7 @@ import os from 'os';
 
 const ROOT = path.resolve(__dirname, '..');
 const FIXTURES = path.join(ROOT, 'tests/fixtures');
-const TMP_WS = path.join(os.tmpdir(), `strata-mcp-jit-${Date.now()}`);
+const TMP_WS = path.join(os.tmpdir(), `seer-mcp-jit-${Date.now()}`);
 const CLI = path.join(ROOT, 'dist/cli/index.js');
 
 let passed = 0;
@@ -32,7 +32,7 @@ function bad(label: string, extra?: unknown): void {
 }
 
 async function main(): Promise<void> {
-  console.log('\nStrata MCP JIT Freshness Test\n=============================\n');
+  console.log('\nSeer MCP JIT Freshness Test\n=============================\n');
 
   fs.mkdirSync(TMP_WS, { recursive: true });
   for (const f of fs.readdirSync(FIXTURES)) {
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
   ok('server initialized');
 
   // Baseline: AuthService should exist
-  const before = JSON.parse((await call('tools/call', { name: 'strata_symbols', arguments: { query: 'AuthService' } })).result.content[0].text);
+  const before = JSON.parse((await call('tools/call', { name: 'seer_symbols', arguments: { query: 'AuthService' } })).result.content[0].text);
   if (before.items.some((i: any) => i.name === 'AuthService')) ok('baseline: AuthService visible');
   else bad('baseline: AuthService missing');
 
@@ -100,7 +100,7 @@ async function main(): Promise<void> {
   // hash check needs the on-disk content to differ.
   await new Promise(r => setTimeout(r, 100));
 
-  const after = JSON.parse((await call('tools/call', { name: 'strata_symbols', arguments: { query: 'jitInjectedFunction' } })).result.content[0].text);
+  const after = JSON.parse((await call('tools/call', { name: 'seer_symbols', arguments: { query: 'jitInjectedFunction' } })).result.content[0].text);
   if (after.items.some((i: any) => i.name === 'jitInjectedFunction')) ok('JIT picked up new function after file edit');
   else bad('JIT did not pick up new function', after);
 
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
   if (fs.existsSync(goPath)) fs.unlinkSync(goPath);
   await new Promise(r => setTimeout(r, 100));
 
-  const stats = JSON.parse((await call('tools/call', { name: 'strata_stats', arguments: {} })).result.content[0].text);
+  const stats = JSON.parse((await call('tools/call', { name: 'seer_stats', arguments: {} })).result.content[0].text);
   if (!('go' in stats.languages)) ok('JIT pruned removed sample.go (go language gone from stats)');
   else bad('JIT did not prune sample.go', stats.languages);
 

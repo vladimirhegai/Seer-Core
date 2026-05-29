@@ -1,4 +1,4 @@
-// Sample Java fixture for Strata smoke tests
+// Sample Java fixture for Seer smoke tests
 import java.util.List;
 import java.util.Optional;
 

@@ -1,4 +1,4 @@
-// Godot-style C# fixture for Strata smoke tests.
+// Godot-style C# fixture for Seer smoke tests.
 // Models a Player CharacterBody2D the way Godot 4's C# bindings expose it.
 // Exercises:
 //   - method_declaration with overrides

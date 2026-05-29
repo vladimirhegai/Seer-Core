@@ -1,4 +1,4 @@
-// SQL DDL for the Strata graph database
+// SQL DDL for the Seer graph database
 
 // Current schema version. Bumped whenever the table layout or column meanings
 // change in a way that older code can't read transparently. Stored on the
@@ -13,7 +13,19 @@
 //   - file_churn (file-level git stats)
 //   - symbol_history + git_index_state (per-symbol commit chains)
 //   - FTS5 virtual table over symbols for BM25 search
-export const CURRENT_SCHEMA_VERSION = 4;
+//
+// v5 adds explicit symbol_role on `symbols`:
+//   - 'definition' (default) | 'declaration' | 'type_ref'
+//   - Required so agent-facing search/ranking can hide forward declarations
+//     and (future) bare type-reference rows by default while keeping them
+//     queryable when callers opt in via includeDeclarations / includeTypeRefs.
+//   - C/C++ class-body method declarations (field_declaration with a
+//     function_declarator inside, no body) are now recorded as 'declaration'
+//     while the out-of-line `void Class::method() { ... }` stays
+//     'definition'. Pre-existing behavior of every other extractor is
+//     preserved: when an extractor doesn't set symbolRole, the Store writes
+//     'definition'.
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -81,13 +93,25 @@ CREATE TABLE IF NOT EXISTS symbols (
   -- as kind:qualified_name(arity?) so a function rename keeps history as long
   -- as the qualified name stays the same. NOT unique - duplicate keys are
   -- possible across files; symbol_history is keyed by (symbol_id, symbol_key).
-  symbol_key     TEXT
+  symbol_key     TEXT,
+  -- v5 symbol_role distinguishes canonical definitions from forward / class-
+  -- body declarations and (future) bare type-reference sites. Default keeps
+  -- legacy behavior: every existing extractor that doesn't set a role gets
+  -- 'definition'. Used by default search/ranking filters to exclude
+  -- declarations unless includeDeclarations=true and to never emit type_ref
+  -- rows in agent-facing defaults unless includeTypeRefs=true.
+  symbol_role    TEXT    NOT NULL DEFAULT 'definition'
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_name           ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_id        ON symbols(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_file_name      ON symbols(file_id, name);
 CREATE INDEX IF NOT EXISTS idx_symbols_pagerank       ON symbols(pagerank DESC);
+-- v5 idx_symbols_symbol_role is created in runMigrations after the column
+-- exists; putting it here would fail on pre-v5 DBs whose symbols table
+-- does not yet have the column (CREATE TABLE IF NOT EXISTS above is a
+-- no-op against an existing pre-v5 table).
 -- v3+ indexes (idx_symbols_is_rankable, idx_symbols_symbol_key) live in
 -- runMigrations because they target columns that don't exist on pre-v3/v4
 -- DBs; trying to create them here on an upgrade would fail before the
@@ -107,6 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_from    ON edges(from_id);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
 CREATE INDEX IF NOT EXISTS idx_edges_to_id   ON edges(to_id);
 CREATE INDEX IF NOT EXISTS idx_edges_kind    ON edges(kind);
+CREATE INDEX IF NOT EXISTS idx_edges_from_to_kind ON edges(from_id, to_id, kind);
 
 -- File-level imports. resolved_file_id is populated by a post-index pass
 -- when the imported module can be mapped to a file we've also indexed.
@@ -173,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_config_keys_key       ON config_keys(key);
 CREATE INDEX IF NOT EXISTS idx_config_keys_file_id   ON config_keys(file_id);
 CREATE INDEX IF NOT EXISTS idx_config_keys_symbol_id ON config_keys(symbol_id);
 
--- v4 file_churn - populated by an optional "strata churn" pass that shells
+-- v4 file_churn - populated by an optional "seer churn" pass that shells
 -- out to git log. One row per indexed file; absent when the file lives
 -- outside a git repo or churn was not run.
 CREATE TABLE IF NOT EXISTS file_churn (

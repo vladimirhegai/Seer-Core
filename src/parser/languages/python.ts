@@ -18,11 +18,28 @@ const PY_NESTING_NODES = new Set<string>([
 // `methods=[...]` kwarg; FastAPI has per-method decorators (`@app.get(...)`).
 const FASTAPI_DECORATOR_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options']);
 
+// Superset of every node type the Python tryExtract* functions may accept.
+const PY_CANDIDATE_NODE_TYPES = [
+  // tryExtractDefinition
+  'function_definition',
+  'class_definition',
+  // tryExtractCallName + tryExtractConfigKey
+  'call',
+  // tryExtractImport
+  'import_statement',
+  'import_from_statement',
+  // tryExtractRoute
+  'decorator',
+  // tryExtractConfigKey
+  'subscript',
+] as const;
+
 export const pythonExtractor: LanguageExtractor = {
   languageName: 'python',
   extensions: ['.py', '.pyw'],
   branchNodeTypes: PY_BRANCH_NODES,
   nestingNodeTypes: PY_NESTING_NODES,
+  candidateNodeTypes: PY_CANDIDATE_NODE_TYPES,
 
   tryExtractDefinition(node: Parser.SyntaxNode): SymbolDef | null {
     switch (node.type) {

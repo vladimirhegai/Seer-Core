@@ -1,5 +1,5 @@
 /**
- * Watcher-mode MCP test. Runs `strata mcp` with watcher ENABLED and JIT
+ * Watcher-mode MCP test. Runs `seer mcp` with watcher ENABLED and JIT
  * DISABLED, edits a file, then waits for the watcher to fire and queries
  * to see whether the new symbol shows up. This verifies the watcher path
  * works independently of JIT — they're two separate safety nets and the
@@ -13,7 +13,7 @@ import os from 'os';
 
 const ROOT = path.resolve(__dirname, '..');
 const FIXTURES = path.join(ROOT, 'tests/fixtures');
-const TMP_WS = path.join(os.tmpdir(), `strata-mcp-watch-${Date.now()}`);
+const TMP_WS = path.join(os.tmpdir(), `seer-mcp-watch-${Date.now()}`);
 const CLI = path.join(ROOT, 'dist/cli/index.js');
 
 let passed = 0;
@@ -25,7 +25,7 @@ const bad = (label: string, extra?: unknown) => {
 };
 
 async function main(): Promise<void> {
-  console.log('\nStrata MCP Watcher Test\n=======================\n');
+  console.log('\nSeer MCP Watcher Test\n=======================\n');
   fs.mkdirSync(TMP_WS, { recursive: true });
   for (const f of fs.readdirSync(FIXTURES)) {
     fs.copyFileSync(path.join(FIXTURES, f), path.join(TMP_WS, f));
@@ -78,8 +78,8 @@ async function main(): Promise<void> {
   ok('server initialized with watcher on');
 
   // Confirm watcher status is reported
-  const h = JSON.parse((await call('tools/call', { name: 'strata_health', arguments: {} })).result.content[0].text);
-  if (h.watcher && h.watcher.watching) ok('strata_health reports watcher=true');
+  const h = JSON.parse((await call('tools/call', { name: 'seer_health', arguments: {} })).result.content[0].text);
+  if (h.watcher && h.watcher.watching) ok('seer_health reports watcher=true');
   else bad('watcher not active', h.watcher);
 
   // Give chokidar a beat to finish its initial scan — even with
@@ -100,7 +100,7 @@ async function main(): Promise<void> {
   let found = false;
   for (let i = 0; i < 75; i++) {
     await new Promise(r => setTimeout(r, 200));
-    const q = JSON.parse((await call('tools/call', { name: 'strata_symbols', arguments: { query: 'watcherInjected' } })).result.content[0].text);
+    const q = JSON.parse((await call('tools/call', { name: 'seer_symbols', arguments: { query: 'watcherInjected' } })).result.content[0].text);
     if (q.items.some((it: any) => it.name === 'watcherInjected')) {
       found = true;
       ok(`watcher picked up new symbol after ${(i + 1) * 200}ms`);

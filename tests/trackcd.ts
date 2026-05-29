@@ -22,7 +22,7 @@ import { Store, ftsQuery, splitIdentifierTokens, makeSymbolKey } from '../src/db
 import { buildArchitecture } from '../src/indexer/architecture';
 
 const FIXTURES = path.join(__dirname, 'fixtures-trackcd');
-const TMP_DB = path.join(os.tmpdir(), `strata-trackcd-${Date.now()}.db`);
+const TMP_DB = path.join(os.tmpdir(), `seer-trackcd-${Date.now()}.db`);
 
 let passed = 0;
 let failed = 0;
@@ -41,7 +41,7 @@ function assertContains(haystack: string[], needle: string, msg: string): void {
 }
 
 async function run(): Promise<void> {
-  console.log('\nStrata Track C + D Feature Tests');
+  console.log('\nSeer Track C + D Feature Tests');
   console.log('================================\n');
 
   if (!fs.existsSync(FIXTURES)) {
@@ -59,7 +59,7 @@ async function run(): Promise<void> {
   console.log('── Schema ──');
   const schema = store.schemaInfo();
   assertEq(schema.current, true, 'schema is current');
-  assertEq(schema.dbVersion, 4, `schema version is v4`);
+  assertEq(schema.dbVersion, 5, `schema version is v5`);
 
   // ── Helper: tokenizer ─────────────────────────────────────────────────────
   console.log('\n── Identifier tokenizer ──');

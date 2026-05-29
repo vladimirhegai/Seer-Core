@@ -40,7 +40,7 @@ export interface WatcherOptions {
   ignored?: (string | RegExp)[];
 }
 
-export class StrataWatcher {
+export class SeerWatcher {
   private watcher: FSWatcher | null = null;
   private dirty = new Set<string>();
   private debounceTimer: NodeJS.Timeout | null = null;
@@ -78,7 +78,7 @@ export class StrataWatcher {
             norm.includes('/.git/') ||
             norm.includes('/dist/') ||
             norm.includes('/build/') ||
-            norm.includes('/.strata/') ||
+            norm.includes('/.seer/') ||
             norm.includes('/target/') ||
             norm.includes('/obj/')
           );
@@ -124,7 +124,7 @@ export class StrataWatcher {
   dirtyCount(): number { return this.dirty.size; }
 
   /**
-   * Snapshot for `strata_health`: when did we last reconcile, how many files,
+   * Snapshot for `seer_health`: when did we last reconcile, how many files,
    * how long did it take. Lets agents tell whether the index they're querying
    * is "this happened just now" vs "we haven't run in 10 minutes."
    */
@@ -145,7 +145,7 @@ export class StrataWatcher {
   }
 
   /**
-   * Force an immediate sync, bypassing the debounce. Used by `strata_reindex`
+   * Force an immediate sync, bypassing the debounce. Used by `seer_reindex`
    * and JIT — both need the dirty set drained NOW, not when a timer fires.
    */
   async syncNow(): Promise<void> {

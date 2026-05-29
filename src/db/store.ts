@@ -2,7 +2,7 @@ import path from 'path';
 import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { CURRENT_SCHEMA_VERSION, SCHEMA_SQL } from './schema.js';
 import type {
-  SymbolDef, SymbolKind, SymbolRow, CallerRow, CalleeRow, StatsRow,
+  SymbolDef, SymbolKind, SymbolRole, SymbolRow, CallerRow, CalleeRow, StatsRow,
   RouteRow, ExternalDepRow, ConfigKeyRow, FileChurnRow, SymbolHistoryRow,
 } from '../types.js';
 
@@ -58,19 +58,91 @@ export interface SymbolSearchOptions {
   limit?: number;
   includeVendor?: boolean;
   includeGenerated?: boolean;
+  /**
+   * When false (default for agent-facing search/ranking), file-role=test
+   * symbols are filtered out. seer_behavior bypasses this because the test
+   * relationship IS its content; everything else (top symbols, search, deps,
+   * complexity) should default to non-test code so agents don't get drowned
+   * in test names. Indexer-wide test indexing stays on so seer_behavior keeps
+   * working — this filter is purely query-side.
+   */
+  includeTests?: boolean;
+  /**
+   * When false (default), rows where symbol_role='declaration' (forward
+   * declarations, C++ class-body method declarations whose bodies live
+   * out-of-line) are hidden. Pass true to include them — useful for
+   * "show me every place this method is announced" workflows.
+   */
+  includeDeclarations?: boolean;
+  /**
+   * When false (default), symbol_role='type_ref' rows stay hidden. Currently
+   * Seer's extractors never emit type-ref rows, so the flag is a forward-
+   * looking opt-in for future indexing modes that materialize them.
+   */
+  includeTypeRefs?: boolean;
 }
 
+/**
+ * Build the per-table predicate clauses for the default project-first lens.
+ * Used by `findSymbols` / `getDefinition` / `getTopSymbols` / `countSymbols`
+ * and the MCP tool wrappers around them. Each `include*` flag turns OFF the
+ * corresponding restriction.
+ *
+ * The function is forgiving about pre-v4 / pre-v5 DBs: when the role columns
+ * or the symbol_role column don't exist on disk, the corresponding clauses
+ * are simply dropped so a read-only open against an old index keeps working.
+ */
 function buildRoleFilter(
-  prefix: string,
+  filePrefix: string,
   includeVendor: boolean,
   includeGenerated: boolean,
   hasRoleColumns: boolean,
+  options?: {
+    symbolPrefix?: string;
+    includeTests?: boolean;
+    includeDeclarations?: boolean;
+    includeTypeRefs?: boolean;
+    hasSymbolRoleColumn?: boolean;
+  },
 ): string {
-  if (!hasRoleColumns) return '';
   const clauses: string[] = [];
-  if (!includeVendor)    clauses.push(`${prefix}is_vendor = 0`);
-  if (!includeGenerated) clauses.push(`${prefix}is_generated = 0`);
+  if (hasRoleColumns) {
+    if (!includeVendor)    clauses.push(`${filePrefix}is_vendor = 0`);
+    if (!includeGenerated) clauses.push(`${filePrefix}is_generated = 0`);
+    if (options && options.includeTests === false) clauses.push(`${filePrefix}role <> 'test'`);
+  }
+  if (options?.hasSymbolRoleColumn) {
+    const sp = options.symbolPrefix ?? 's.';
+    if (options.includeDeclarations === false) clauses.push(`${sp}symbol_role <> 'declaration'`);
+    if (options.includeTypeRefs === false)     clauses.push(`${sp}symbol_role <> 'type_ref'`);
+  }
   return clauses.length === 0 ? '' : 'AND ' + clauses.join(' AND ');
+}
+
+/**
+ * Resolve the agent-facing query defaults for the include-flags. The contract:
+ *   - vendor / generated stay hidden by default (existing behavior).
+ *   - tests stay hidden by default for ranking/search tools, on top of the
+ *     existing file-role classification. seer_behavior overrides via
+ *     includeTests=true since tests ARE its content.
+ *   - declarations stay hidden by default so callers/top-by-rank focus on
+ *     real definition sites.
+ *   - type_refs stay hidden by default (and aren't even produced yet).
+ */
+function resolveSearchFlags(opts: SymbolSearchOptions): {
+  includeVendor: boolean;
+  includeGenerated: boolean;
+  includeTests: boolean;
+  includeDeclarations: boolean;
+  includeTypeRefs: boolean;
+} {
+  return {
+    includeVendor:       opts.includeVendor       ?? false,
+    includeGenerated:    opts.includeGenerated    ?? false,
+    includeTests:        opts.includeTests        ?? false,
+    includeDeclarations: opts.includeDeclarations ?? false,
+    includeTypeRefs:     opts.includeTypeRefs     ?? false,
+  };
 }
 
 export interface StoreOptions {
@@ -119,6 +191,12 @@ export class Store {
   private hasRoleColumns: boolean;
   private hasComplexityColumns: boolean;
   private hasV4Tables: boolean;
+  /**
+   * True when the v5 `symbols.symbol_role` column exists. Read-only opens
+   * against a pre-v5 DB transparently skip declaration/type_ref filtering;
+   * writer opens always have it since runMigrations() adds the column.
+   */
+  private hasSymbolRoleColumn: boolean;
 
   // Prepared statements — initialized in constructor (writer path only)
   private stmtUpsertFile!: StatementSync;
@@ -153,6 +231,7 @@ export class Store {
     this.hasRoleColumns = this.checkHasRoleColumns();
     this.hasComplexityColumns = this.hasColumn('symbols', 'cyclomatic');
     this.hasV4Tables = this.checkHasV4Tables();
+    this.hasSymbolRoleColumn = this.hasColumn('symbols', 'symbol_role');
   }
 
   private checkHasRoleColumns(): boolean {
@@ -217,6 +296,7 @@ export class Store {
     const isV3Migration = !this.hasColumn('symbols', 'is_rankable');
     this.addColumnIfMissing('symbols', 'is_rankable', 'INTEGER NOT NULL DEFAULT 1');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_is_rankable ON symbols(is_rankable)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_file_name ON symbols(file_id, name)');
     if (isV3Migration) {
       this.db.prepare(
         `UPDATE symbols SET is_rankable = 0 WHERE kind NOT IN ('function','method','constructor','class')`,
@@ -233,6 +313,7 @@ export class Store {
     this.addColumnIfMissing('symbols', 'symbol_key',  'TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_from_to_kind ON edges(from_id, to_id, kind)');
 
     // v4.1: separate history HEAD marker so churn doesn't poison the
     // skip-if-unchanged check used by buildSymbolHistory. Cheap ALTER ADD;
@@ -240,10 +321,18 @@ export class Store {
     this.addColumnIfMissing('git_index_state', 'last_history_head_sha', 'TEXT');
     this.addColumnIfMissing('git_index_state', 'last_history_at',       'INTEGER');
 
+    // v5: symbol_role on symbols. The NOT NULL DEFAULT 'definition' on the
+    // ALTER means every pre-v5 row gets a sane default without an explicit
+    // UPDATE backfill. The role only changes its meaning when the indexer
+    // re-runs against the file (e.g. for C/C++ fixtures where field_declaration
+    // is now emitted as 'declaration').
+    this.addColumnIfMissing('symbols', 'symbol_role', "TEXT NOT NULL DEFAULT 'definition'");
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_symbol_role ON symbols(symbol_role)');
+
     // v4 backfill — required because upsertFileWithCache() short-circuits on
     // unchanged content hash, so a v3 DB upgraded to v4 would never get
     // symbol_key populated (nor FTS rebuilt) for any file whose source hadn't
-    // changed. That left strata_history with zero candidates and FTS search
+    // changed. That left seer_history with zero candidates and FTS search
     // returning empty for the entire pre-upgrade corpus until a manual
     // --reset. Both backfills are cheap and idempotent.
     if (isV4Migration) {
@@ -281,7 +370,7 @@ export class Store {
   /**
    * Rebuild symbols_fts / files_fts from the current symbols / files rows if
    * either FTS table is empty while its source table has rows. This is the
-   * only safe trigger condition — Strata never deliberately leaves FTS empty
+   * only safe trigger condition — Seer never deliberately leaves FTS empty
    * while symbols are populated, so emptiness is a reliable "stale FTS"
    * signal (post-migration or post-manual-patch).
    */
@@ -360,8 +449,8 @@ export class Store {
     this.stmtInsertSymbol = this.db.prepare(`
       INSERT INTO symbols
         (name, qualified_name, kind, file_id, line_start, line_end, col_start, col_end,
-         signature, is_rankable, loc, cyclomatic, cognitive, max_nesting, symbol_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         signature, is_rankable, loc, cyclomatic, cognitive, max_nesting, symbol_key, symbol_role)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.stmtInsertEdge = this.db.prepare(`
@@ -527,7 +616,13 @@ export class Store {
   insertSymbol(fileId: number, def: SymbolDef): number {
     const sig = def.signature ? def.signature.slice(0, 240) : null;
     const qualified = def.qualifiedName ?? def.name;
-    const rankable = isRankableKind(def.kind) ? 1 : 0;
+    const symbolRole: SymbolRole = def.symbolRole ?? 'definition';
+    // Declarations are not call targets in the same canonical sense as
+    // definitions, so they're excluded from PageRank just like type rows.
+    // The kind-based rankability still applies — a class declaration would
+    // already be non-rankable from the kind check; this is the belt-and-
+    // suspenders guard for the rarer "method declaration" case.
+    const rankable = (symbolRole === 'definition' && isRankableKind(def.kind)) ? 1 : 0;
     const symbolKey = makeSymbolKey(def.kind, qualified);
     const result = this.stmtInsertSymbol.run(
       def.name, qualified, def.kind, fileId,
@@ -540,6 +635,7 @@ export class Store {
       def.cognitive ?? null,
       def.maxNesting ?? null,
       symbolKey,
+      symbolRole,
     );
     const symbolId = toNum(result.lastInsertRowid);
     try {
@@ -757,7 +853,7 @@ export class Store {
    * Promote calls from a test-file symbol to a non-test target into 'tests'
    * edges (in addition to keeping the original 'call' edge). The original
    * call edge is left in place so caller/callee queries don't double-count;
-   * test edges live in their own kind so `strata_behavior` can pull them
+   * test edges live in their own kind so `seer_behavior` can pull them
    * directly without scanning the full edge table.
    *
    * Returns the number of new test edges inserted.
@@ -894,13 +990,27 @@ export class Store {
     }));
   }
 
+  /**
+   * Build the predicate suffix shared by findSymbols / getDefinition /
+   * getTopSymbols / countSymbols. Returns the `AND …` string that augments a
+   * WHERE clause; never starts the WHERE itself so callers control the rest.
+   */
+  private filterClauseFromOptions(opts: SymbolSearchOptions): string {
+    const f = resolveSearchFlags(opts);
+    return buildRoleFilter('f.', f.includeVendor, f.includeGenerated, this.hasRoleColumns, {
+      symbolPrefix: 's.',
+      includeTests: f.includeTests,
+      includeDeclarations: f.includeDeclarations,
+      includeTypeRefs: f.includeTypeRefs,
+      hasSymbolRoleColumn: this.hasSymbolRoleColumn,
+    });
+  }
+
   findSymbols(name: string, options: SymbolSearchOptions = {}): SymbolRow[] {
     const limit = Math.max(1, options.limit ?? 50);
-    const includeVendor = options.includeVendor ?? false;
-    const includeGenerated = options.includeGenerated ?? false;
-    const filter = buildRoleFilter('f.', includeVendor, includeGenerated, this.hasRoleColumns);
+    const filter = this.filterClauseFromOptions(options);
     const rows = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE (s.name LIKE ? OR s.qualified_name LIKE ?)
         ${filter}
@@ -921,14 +1031,10 @@ export class Store {
     if (!this.hasV4Tables) return this.findSymbols(query, options);
     const matchExpr = ftsQuery(query);
     if (!matchExpr) return this.findSymbols(query, options);
-    const filter = buildRoleFilter('f.',
-      options.includeVendor ?? false,
-      options.includeGenerated ?? false,
-      this.hasRoleColumns,
-    );
+    const filter = this.filterClauseFromOptions(options);
     try {
       const rows = this.db.prepare(`
-        SELECT ${symbolSelectCols(this.hasComplexityColumns)},
+        SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)},
                bm25(symbols_fts) AS rank
         FROM symbols_fts
         JOIN symbols s ON s.id = symbols_fts.rowid
@@ -946,10 +1052,13 @@ export class Store {
   /**
    * FTS5 search over file paths. Returns matching files ranked by BM25.
    */
-  searchFilesFts(query: string, limit = 30): Array<{ id: number; path: string; relPath: string; language: string; role: string }> {
+  searchFilesFts(query: string, limit = 30, options: { includeTests?: boolean; includeVendor?: boolean; includeGenerated?: boolean } = {}): Array<{ id: number; path: string; relPath: string; language: string; role: string }> {
     if (!this.hasV4Tables) return [];
     const matchExpr = ftsQuery(query);
     if (!matchExpr) return [];
+    const includeTests = options.includeTests ?? false;
+    const includeVendor = options.includeVendor ?? false;
+    const includeGenerated = options.includeGenerated ?? false;
     try {
       const rows = this.db.prepare(`
         SELECT f.id, f.path, f.rel_path AS relPath, f.language, f.role
@@ -958,20 +1067,27 @@ export class Store {
         WHERE files_fts MATCH ?
         ORDER BY bm25(files_fts)
         LIMIT ?
-      `).all(matchExpr, limit) as Row[];
-      return rows.map(r => ({
-        id: toNum(r.id),
-        path: toStr(r.path),
-        relPath: toStr(r.relPath),
-        language: toStr(r.language),
-        role: toStr(r.role),
-      }));
+      `).all(matchExpr, limit * 2) as Row[];
+      return rows
+        .map(r => ({
+          id: toNum(r.id),
+          path: toStr(r.path),
+          relPath: toStr(r.relPath),
+          language: toStr(r.language),
+          role: toStr(r.role),
+        }))
+        .filter(f =>
+          (includeVendor    || f.role !== 'vendor') &&
+          (includeGenerated || f.role !== 'generated') &&
+          (includeTests     || f.role !== 'test'),
+        )
+        .slice(0, limit);
     } catch { return []; }
   }
 
   listSymbolsInFile(filePath: string, limit = 200): SymbolRow[] {
     const rows = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE f.path = ? OR f.rel_path = ?
       ORDER BY s.line_start
@@ -981,13 +1097,11 @@ export class Store {
     return rows.map(toSymbolRow);
   }
 
-  getTopSymbols(limit = 20, options: { includeVendor?: boolean; includeGenerated?: boolean } = {}): SymbolRow[] {
-    const includeVendor = options.includeVendor ?? false;
-    const includeGenerated = options.includeGenerated ?? false;
-    const filter = buildRoleFilter('f.', includeVendor, includeGenerated, this.hasRoleColumns);
+  getTopSymbols(limit = 20, options: SymbolSearchOptions = {}): SymbolRow[] {
+    const filter = this.filterClauseFromOptions(options);
     const where = filter ? `WHERE ${filter.replace(/^AND\s+/, '')}` : '';
     const rows = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       ${where}
       ORDER BY s.pagerank DESC
@@ -997,11 +1111,11 @@ export class Store {
     return rows.map(toSymbolRow);
   }
 
-  getDefinition(name: string, options: { filePath?: string; includeVendor?: boolean; includeGenerated?: boolean } = {}): SymbolRow[] {
-    const filter = buildRoleFilter('f.', options.includeVendor ?? false, options.includeGenerated ?? false, this.hasRoleColumns);
+  getDefinition(name: string, options: { filePath?: string } & SymbolSearchOptions = {}): SymbolRow[] {
+    const filter = this.filterClauseFromOptions(options);
     const fileClause = options.filePath ? 'AND (f.path = ? OR f.rel_path = ?)' : '';
     const stmt = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE (s.name = ? OR s.qualified_name = ?)
         ${filter}
@@ -1018,15 +1132,15 @@ export class Store {
 
   getSymbolById(id: number): SymbolRow | null {
     const row = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE s.id = ?
     `).get(id) as Row | undefined;
     return row ? toSymbolRow(row) : null;
   }
 
-  countSymbols(name: string, options: { includeVendor?: boolean; includeGenerated?: boolean } = {}): number {
-    const filter = buildRoleFilter('f.', options.includeVendor ?? false, options.includeGenerated ?? false, this.hasRoleColumns);
+  countSymbols(name: string, options: SymbolSearchOptions = {}): number {
+    const filter = this.filterClauseFromOptions(options);
     const row = this.db.prepare(`
       SELECT COUNT(*) AS c
       FROM symbols s JOIN files f ON f.id = s.file_id
@@ -1396,11 +1510,11 @@ export class Store {
     `).run(repoRoot, Date.now(), remoteUrl, lastHistoryHeadSha, Date.now());
   }
 
-  /** All symbols matching a symbol_key — used by `strata_history` to find the
+  /** All symbols matching a symbol_key — used by `seer_history` to find the
    *  current id for a key that came from the indexed graph. */
   findSymbolsByKey(symbolKey: string): SymbolRow[] {
     const rows = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE s.symbol_key = ?
       ORDER BY s.pagerank DESC
@@ -1543,7 +1657,7 @@ export class Store {
       args.push(start); // s.line_end >= rangeStart
     }
     const rows = this.db.prepare(`
-      SELECT ${symbolSelectCols(this.hasComplexityColumns)}
+      SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE s.file_id = ? AND (${clauses})
       ORDER BY s.line_start
@@ -1599,13 +1713,14 @@ export class Store {
   }
 }
 
-function symbolSelectCols(hasComplexity: boolean): string {
-  const base =
+function symbolSelectCols(hasComplexity: boolean, hasSymbolRole: boolean): string {
+  let cols =
     `s.id, s.name, s.qualified_name AS qualifiedName, s.kind, s.file_id AS fileId,
      f.path AS filePath, s.line_start AS lineStart,
      s.line_end AS lineEnd, s.signature, s.pagerank`;
-  if (!hasComplexity) return base;
-  return `${base}, s.loc, s.cyclomatic, s.cognitive, s.max_nesting AS maxNesting`;
+  if (hasComplexity)  cols += `, s.loc, s.cyclomatic, s.cognitive, s.max_nesting AS maxNesting`;
+  if (hasSymbolRole)  cols += `, s.symbol_role AS symbolRole`;
+  return cols;
 }
 
 function toSymbolRow(r: Row): SymbolRow {
@@ -1624,6 +1739,7 @@ function toSymbolRow(r: Row): SymbolRow {
     cyclomatic: toNullNum(r.cyclomatic),
     cognitive: toNullNum(r.cognitive),
     maxNesting: toNullNum(r.maxNesting),
+    symbolRole: r.symbolRole == null ? null : (toStr(r.symbolRole) as 'definition' | 'declaration' | 'type_ref'),
   };
 }
 

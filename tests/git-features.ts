@@ -17,7 +17,7 @@ import { buildSymbolHistory } from '../src/indexer/symbolhistory';
 import { detectChanges } from '../src/indexer/detectchanges';
 import { extractPrNumber, githubPrUrl } from '../src/indexer/git';
 
-const TMP = path.join(os.tmpdir(), `strata-git-${Date.now()}`);
+const TMP = path.join(os.tmpdir(), `seer-git-${Date.now()}`);
 const REPO = path.join(TMP, 'repo');
 const DB = path.join(TMP, 'graph.db');
 
@@ -55,7 +55,7 @@ function write(rel: string, content: string): void {
 }
 
 async function run(): Promise<void> {
-  console.log('\nStrata Git-Features Tests');
+  console.log('\nSeer Git-Features Tests');
   console.log('=========================\n');
 
   // Setup
