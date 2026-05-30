@@ -1,23 +1,23 @@
-<h1 align="center">
-  Seer Core
-  <img src="docs/logo.png" alt="Seer Logo" width="100" align="right" />
-</h1>
+<div align="center">
+<img src="docs/logo.png" width="200" height="200"/>
 
+# Seer Core
 
-Give your AI agents a map of your repo before they edit.
+**Give your AI agents a map of your repo before they edit.**
 
 Seer helps agents find code, follow context, and understand what they are changing.
 
-Callers, tests, routes, service links, and git history, all in one local map for your coding agent.
+*Callers, tests, routes, service links, and git history, all in one local map for your coding agent.*
 
-<p align="center">
-  <a href="https://github.com/vladimirhegai/Seer-Core"><img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square" alt="Version" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License" /></a>
-  <a href="docs/mcp.md"><img src="https://img.shields.io/badge/MCP-Enabled-brightgreen?style=flat-square" alt="MCP Enabled" /></a>
-  <img src="https://img.shields.io/badge/TypeScript-Ready-blue?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Database-SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite" />
-  <img src="https://img.shields.io/badge/Node.js-%3E%3D_18-green?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" />
-</p>
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/vladimirhegai/Seer-Core)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![MCP](https://img.shields.io/badge/MCP-Enabled-brightgreen.svg)](docs/mcp.md)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg?logo=typescript)](https://www.typescriptlang.org/)
+[![Database](https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite)](https://www.sqlite.org/)
+[![NodeJS](https://img.shields.io/badge/Node.js-%3E%3D_18-green.svg?logo=nodedotjs)](https://nodejs.org/)
+
+</div>
+
 
 
 [pimage]
