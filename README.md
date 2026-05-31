@@ -44,24 +44,22 @@ One command, from inside the repo you want indexed (needs Node 24+):
 npx seer-mcp init
 ```
 
-### Standard Init vs. Specific Clients
-* **Standard Init (`npx seer-mcp init`)**: Configures all standard project-local clients. It automatically writes local workspace configurations for **Claude Code** (`.mcp.json`), **OpenAI Codex** (`.codex/config.toml`), **Gemini CLI** (`.gemini/settings.json`), **VS Code** (`.vscode/mcp.json`), and **Cursor** (`.cursor/mcp.json`).
-* **With Google Antigravity & Extensions (`npx seer-mcp init --client claude,codex,gemini,antigravity`)**: If you use the Google Antigravity IDE with the Standard Gemini features alongside the Claude and Codex extensions, targeting these clients explicitly configures all of them at once. It writes to your user-level Antigravity settings (`~/.gemini/antigravity-ide/mcp_config.json`) and drops local workspace configurations for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), and Gemini (`.gemini/settings.json`).
+If you use **Google Antigravity** (Standard Gemini + Claude & Codex extensions), run this instead:
+```bash
+npx seer-mcp init --client claude,codex,gemini,antigravity
+```
 
 Reload your agent/extensions and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.)
 
-There is nothing else to run. Seer installs nothing native, and it indexes the
-workspace automatically on the first query, so there is no build or index step
-to do yourself. On a very large repo that first index can take a couple of
-minutes; after that it is cached and you never wait on it again.
+Seer indexes your workspace automatically on the first query.
 
 > [!TIP]
-> **Optional Pre-indexing:** If you are working on a very large repository and want to avoid any first-query latency from your agent, you can pre-index your workspace manually in your terminal before launching the agent:
+> **Optional Pre-indexing:** Avoid any first-query latency by manually pre-indexing:
 > ```bash
 > npx seer-mcp index .
 > ```
 
-Want user-level config or to paste config by hand? Read the [MCP Setup](docs/mcp.md) guide.
+Want user-level config? Read the [MCP Setup](docs/mcp.md) guide.
 
 → [Full Quick Start](docs/quickstart.md)
 
