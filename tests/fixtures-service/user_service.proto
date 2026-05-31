@@ -1,0 +1,33 @@
+// Test fixture for gRPC service detection.
+// The proto scanner should emit one route per rpc with operation="Service/Method".
+
+syntax = "proto3";
+
+package user.v1;
+
+service UserService {
+  // Single response RPC
+  rpc GetUser   (GetUserRequest)   returns (GetUserResponse);
+  // Server-streaming RPC
+  rpc ListUsers (ListUsersRequest) returns (stream User);
+  // Mutation-style RPC with HTTP annotation
+  rpc CreateUser (CreateUserRequest) returns (CreateUserResponse) {
+    option (google.api.http) = { post: "/v1/users" body: "*" };
+  }
+}
+
+service AuthService {
+  rpc Login  (LoginRequest)  returns (LoginResponse);
+  rpc Logout (LogoutRequest) returns (LogoutResponse);
+}
+
+message GetUserRequest  { string id = 1; }
+message GetUserResponse { string id = 1; string name = 2; }
+message ListUsersRequest {}
+message User             { string id = 1; string name = 2; }
+message CreateUserRequest  { string name = 1; }
+message CreateUserResponse { string id = 1; }
+message LoginRequest  { string username = 1; string password = 2; }
+message LoginResponse { string token = 1; }
+message LogoutRequest  { string token = 1; }
+message LogoutResponse { bool ok = 1; }

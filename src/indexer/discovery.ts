@@ -160,8 +160,15 @@ export async function discoverFiles(repoRoot: string, options: DiscoveryOptions 
     },
   );
 
+  // Stable order across runs is a correctness requirement: file IDs are
+  // AUTOINCREMENT, and tests/scale invariants depend on the same input
+  // producing the same IDs. `fast-glob` on Windows returns files in MFT/
+  // FS-cache order, which is not stable run-to-run. Sort here so every
+  // downstream stage — the byte semaphore window, parser-worker dispatch,
+  // SQLite inserts — sees the same sequence on every invocation.
   return entries
     .filter(rel => !ig.ignores(rel))
+    .sort()
     .map(rel => ({
       absolutePath: path.join(absRoot, rel),
       relativePath: rel,

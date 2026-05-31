@@ -70,6 +70,16 @@ export const cppExtractor: LanguageExtractor = {
       case 'function_definition': {
         const declarator = node.childForFieldName('declarator');
         if (!declarator) return null;
+        // Out-of-line method definitions name their owner via a
+        // qualified_identifier declarator (`Vec<T>::dot`, `A::B::method`).
+        // Surface the owner scope so the qualified name is `…Vec.dot`, not a
+        // bare `dot` that reads like a free function.
+        const qual = extractQualifiedScope(declarator);
+        if (qual && qual.scopes.length > 0) {
+          const def = mkDef(qual.name, 'function', node);
+          def.scopePath = qual.scopes;
+          return def;
+        }
         const name = extractDeclaratorName(declarator);
         if (!name) return null;
         return mkDef(name, 'function', node);
@@ -291,6 +301,51 @@ function extractDeclaratorName(node: Parser.SyntaxNode): string | null {
   }
 
   return null;
+}
+
+/**
+ * For an out-of-line definition whose declarator is (or wraps) a
+ * `qualified_identifier`, return the owner scope chain and the leaf name:
+ *
+ *   void Foo::bar() {}            → { scopes: ['Foo'],    name: 'bar' }
+ *   T    Vec<T>::dot() {}         → { scopes: ['Vec'],    name: 'dot' }   (template args folded off)
+ *   int  A::B::compute() {}       → { scopes: ['A','B'],  name: 'compute' }
+ *   void Widget::~Widget() {}     → { scopes: ['Widget'], name: '~Widget' }
+ *
+ * Returns null when the declarator is unqualified (a normal free function or
+ * in-class definition) so the caller falls back to the plain name path.
+ */
+function extractQualifiedScope(
+  declarator: Parser.SyntaxNode,
+): { scopes: string[]; name: string } | null {
+  // Unwrap pointer/reference/function/parenthesized declarators to the core.
+  let node: Parser.SyntaxNode | null = declarator;
+  while (
+    node &&
+    (node.type === 'function_declarator' ||
+      node.type === 'pointer_declarator' ||
+      node.type === 'reference_declarator' ||
+      node.type === 'parenthesized_declarator')
+  ) {
+    node = node.childForFieldName('declarator');
+  }
+  if (!node || node.type !== 'qualified_identifier') return null;
+
+  const scopes: string[] = [];
+  let cur: Parser.SyntaxNode | null = node;
+  while (cur && cur.type === 'qualified_identifier') {
+    const scope = cur.childForFieldName('scope');
+    if (scope) {
+      // Fold template arguments off the scope: `Vec<T>` → `Vec`. Anonymous or
+      // empty scopes are skipped rather than emitted as ''.
+      const folded = scope.text.split('<')[0].trim();
+      if (folded) scopes.push(folded);
+    }
+    cur = cur.childForFieldName('name');
+  }
+  const name = cur ? extractDeclaratorName(cur) : null;
+  if (!name) return null;
+  return { scopes, name };
 }
 
 function mkDef(name: string, kind: SymbolKind, node: Parser.SyntaxNode): SymbolDef {

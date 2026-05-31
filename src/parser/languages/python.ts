@@ -1,5 +1,5 @@
 import type Parser from 'web-tree-sitter';
-import type { SymbolDef, RouteDef, ConfigKeyRead } from '../../types.js';
+import type { SymbolDef, RouteDef, ConfigKeyRead, ServiceCallDef } from '../../types.js';
 import type { LanguageExtractor } from '../walker.js';
 import { firstLine } from '../walker.js';
 
@@ -17,6 +17,11 @@ const PY_NESTING_NODES = new Set<string>([
 // FastAPI / Flask decorator method names. Flask uses `app.route(...)` with a
 // `methods=[...]` kwarg; FastAPI has per-method decorators (`@app.get(...)`).
 const FASTAPI_DECORATOR_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options']);
+
+// HTTP-client verbs (outbound). Subset of FastAPI verbs + 'request' (httpx/requests).
+const PY_HTTP_CLIENT_VERBS = new Set([
+  'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request',
+]);
 
 // Superset of every node type the Python tryExtract* functions may accept.
 const PY_CANDIDATE_NODE_TYPES = [
@@ -180,6 +185,76 @@ export const pythonExtractor: LanguageExtractor = {
   },
 
   /**
+   * Detect HTTP client calls in Python — requests.<verb>(url, …),
+   * httpx.<verb>(url, …), aiohttp/requests.Session() instances.
+   *
+   *   requests.get('/health')                       ← yes
+   *   requests.post('/api/x', json=…)               ← yes
+   *   httpx.AsyncClient().get('/api/x')             ← yes (any obj.<verb>(literalUrl))
+   *   client.get('/api/x')                          ← yes (generic obj.<verb>)
+   *   logger.get('count')                           ← no (not a URL-shaped arg)
+   */
+  tryExtractServiceCalls(node: Parser.SyntaxNode): ServiceCallDef[] | null {
+    if (node.type !== 'call') return null;
+    // A call that is the direct payload of a decorator (`@app.post("/x")`) is a
+    // FastAPI/router ROUTE registration, not an outbound client call. The
+    // walker's route/service-call de-dup is node-level and only suppresses the
+    // service call when the SAME node yielded a route; here the route is
+    // emitted on the parent `decorator` node, so we must guard here to avoid a
+    // false-positive http-client call that the resolver would then self-link to
+    // the service's own route. (Flask `@app.route` never reached this path since
+    // 'route' isn't an HTTP verb, but FastAPI `@app.get/post/...` did.)
+    if (node.parent?.type === 'decorator') return null;
+    const fn = node.childForFieldName('function');
+    if (!fn || fn.type !== 'attribute') return null;
+    const obj = fn.childForFieldName('object');
+    const attr = fn.childForFieldName('attribute');
+    if (!obj || !attr) return null;
+
+    const verb = attr.text.toLowerCase();
+    if (!PY_HTTP_CLIENT_VERBS.has(verb)) return null;
+
+    // Categorize: known-library object (requests/httpx) → label by name.
+    let framework: string;
+    const objText = obj.text;
+    if (obj.type === 'identifier' && (objText === 'requests' || objText === 'httpx')) {
+      framework = objText;
+    } else {
+      framework = 'http-client';
+    }
+
+    const args = node.childForFieldName('arguments');
+    if (!args) return null;
+    const first = args.namedChildren[0];
+    if (!first) return null;
+
+    let raw: string | null = null;
+    let envKey: string | undefined;
+    if (first.type === 'string') raw = stripPyQuotes(first.text);
+    else if (first.type === 'concatenated_string') raw = stripPyQuotes(first.text);
+    else if (first.type === 'binary_operator') {
+      // Crude: os.environ['BASE_URL'] + '/charge'
+      const r = readBinaryConcat(first);
+      if (r) { raw = r.text; envKey = r.envKey; }
+    } else if (first.type === 'string' || first.type === 'f_string') {
+      raw = first.text.startsWith('f') ? null : stripPyQuotes(first.text);
+    }
+    if (!raw) return null;
+    if (!pyLooksLikeHttpTarget(raw)) return null;
+
+    const def: ServiceCallDef = {
+      protocol: 'http',
+      method: verb === 'request' ? 'ANY' : verb.toUpperCase(),
+      rawTarget: raw.slice(0, 240),
+      framework,
+      line: node.startPosition.row,
+      confidence: 0.85,
+    };
+    if (envKey) def.envKey = envKey;
+    return [def];
+  },
+
+  /**
    * Python env var reads: `os.getenv("NAME")`, `os.environ["NAME"]`,
    * `os.environ.get("NAME")`. `getenv("X", "default")` also handled.
    */
@@ -244,4 +319,52 @@ function stripPyQuotes(s: string): string {
   if (t.startsWith('"""') && t.endsWith('"""')) return t.slice(3, -3);
   if (t.startsWith("'''") && t.endsWith("'''")) return t.slice(3, -3);
   return t.replace(/^['"]|['"]$/g, '');
+}
+
+function pyLooksLikeHttpTarget(s: string): boolean {
+  if (!s) return false;
+  if (s.startsWith('/')) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  if (/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9_-]/.test(s)) return true;
+  return false;
+}
+
+/**
+ * Walk a binary `+` chain like `os.environ['BASE'] + '/charge'`, returning
+ * the concatenated literal text where possible plus any env key seen.
+ */
+function readBinaryConcat(node: Parser.SyntaxNode): { text: string; envKey?: string } | null {
+  let text = '';
+  let envKey: string | undefined;
+  function visit(n: Parser.SyntaxNode): void {
+    if (n.type === 'string') text += stripPyQuotes(n.text);
+    else if (n.type === 'subscript') {
+      const value = n.childForFieldName('value');
+      const sub = n.childForFieldName('subscript');
+      if (value?.type === 'attribute') {
+        const obj = value.childForFieldName('object');
+        const attr = value.childForFieldName('attribute');
+        if (!envKey && obj?.text === 'os' && attr?.text === 'environ' && sub?.type === 'string') {
+          envKey = stripPyQuotes(sub.text);
+        }
+      }
+    } else if (n.type === 'call') {
+      // os.getenv("X")
+      const fn = n.childForFieldName('function');
+      if (fn?.type === 'attribute') {
+        const o = fn.childForFieldName('object');
+        const a = fn.childForFieldName('attribute');
+        if (!envKey && o?.text === 'os' && a?.text === 'getenv') {
+          const args = n.childForFieldName('arguments');
+          const first = args?.namedChildren[0];
+          if (first?.type === 'string') envKey = stripPyQuotes(first.text);
+        }
+      }
+    } else if (n.type === 'binary_operator') {
+      for (const c of n.namedChildren) visit(c);
+    }
+  }
+  visit(node);
+  if (!text && !envKey) return null;
+  return { text, envKey };
 }

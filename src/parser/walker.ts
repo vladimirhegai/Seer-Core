@@ -1,5 +1,5 @@
 import type Parser from 'web-tree-sitter';
-import type { SymbolDef, SymbolRef, FileExtraction, RouteDef, ConfigKeyRead } from '../types.js';
+import type { SymbolDef, SymbolRef, FileExtraction, RouteDef, ConfigKeyRead, ServiceCallDef } from '../types.js';
 
 export interface LanguageExtractor {
   /** tree-sitter language name (used to load the WASM grammar) */
@@ -26,6 +26,14 @@ export interface LanguageExtractor {
 
   /** Optional: extract a config/env key read from a node. */
   tryExtractConfigKey?(node: Parser.SyntaxNode): ConfigKeyRead | null;
+
+  /**
+   * Optional: extract zero-or-more outbound service calls from a node.
+   * Languages return different shapes for clients (Python `requests.get('/x')`
+   * vs JS `fetch('/x')` vs Go `http.Get('/x')`), so the extractor owns the
+   * recognizer. Returns null when the node is not a service-call site.
+   */
+  tryExtractServiceCalls?(node: Parser.SyntaxNode): ServiceCallDef[] | null;
 
   /**
    * Set of tree-sitter node types that count as control-flow branches for
@@ -87,6 +95,7 @@ export function walkTree(
     importedModules: [],
     routes: [],
     configKeys: [],
+    serviceCalls: [],
   };
 
   const defStack: string[] = [];
@@ -119,7 +128,15 @@ export function walkTree(
 
     const def = isCandidate ? extractor.tryExtractDefinition(node) : null;
     if (def) {
-      const disambig = pushName(def.name);
+      // Out-of-line / qualified definitions (e.g. C++ `Vec::dot` defined at
+      // namespace scope) carry extra owning-scope segments that aren't on the
+      // lexical def stack. Fold them into the local name so the qualified name
+      // reflects the true owner, and key overload disambiguation on the full
+      // (scope + name) so `Foo::bar` and `Baz::bar` don't collapse together.
+      const localName = def.scopePath && def.scopePath.length > 0
+        ? `${def.scopePath.join('.')}.${def.name}`
+        : def.name;
+      const disambig = pushName(localName);
       def.qualifiedName =
         defStack.length === 1
           ? disambig
@@ -133,9 +150,9 @@ export function walkTree(
       ) {
         const m = measureComplexity(node, extractor.branchNodeTypes, extractor.nestingNodeTypes);
         def.cyclomatic = m.cyclomatic;
-        def.cognitive  = m.cognitive;
+        def.cognitive = m.cognitive;
         def.maxNesting = m.maxNesting;
-        def.loc        = m.loc;
+        def.loc = m.loc;
       } else if (def.kind === 'function' || def.kind === 'method' || def.kind === 'constructor') {
         // LOC even without branchNodeTypes — cheap and useful.
         def.loc = countNonBlankLines(node);
@@ -162,14 +179,30 @@ export function walkTree(
       // Returning routes doesn't prevent the call from also being recorded —
       // the route registration call is itself useful in the call graph.
       const routes = extractor.tryExtractRoute?.(node);
+      let wasRoute = false;
       if (routes && routes.length > 0) {
         for (const r of routes) extraction.routes!.push(r);
+        wasRoute = true;
       }
 
       const configKey = extractor.tryExtractConfigKey?.(node);
       if (configKey) {
         configKey.callerName = defStack.length > 0 ? defStack.join('.') : '';
         extraction.configKeys!.push(configKey);
+      }
+
+      // Skip service-call extraction on nodes that were already classified as
+      // route registrations — `app.post('/api/x', handler)` is a server-side
+      // mount, not a client dialing /api/x. Without this guard the resolver
+      // would see two service_calls for every route and link the route handler
+      // to its own registration site.
+      const svcCalls = !wasRoute ? extractor.tryExtractServiceCalls?.(node) : null;
+      if (svcCalls && svcCalls.length > 0) {
+        const callerName = defStack.length > 0 ? defStack.join('.') : '';
+        for (const sc of svcCalls) {
+          sc.callerName = sc.callerName ?? callerName;
+          extraction.serviceCalls!.push(sc);
+        }
       }
 
       const callee = extractor.tryExtractCallName(node);

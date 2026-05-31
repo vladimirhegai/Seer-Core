@@ -4,6 +4,9 @@ import path from 'path';
 import fs from 'fs';
 import { Indexer } from '../indexer/index.js';
 import { Store } from '../db/store.js';
+import { rankedBehavior } from '../indexer/behavior.js';
+import { computeRisk } from '../indexer/risk.js';
+import { buildContext } from '../indexer/context.js';
 
 const VERSION = '0.1.0';
 
@@ -43,7 +46,10 @@ program
   .option('--include-vendor', 'Index vendor/ vendored/ thirdparty/ directories')
   .option('--include-generated', 'Index *.generated.* / *.pb.* / *.gen.* files')
   .option('--mode <mode>', 'Discovery mode: full | standard | fast (default: standard).', 'standard')
-  .action(async (repoPath: string, opts: { db?: string; verbose?: boolean; reset?: boolean; maxFileKb: string; includeVendor?: boolean; includeGenerated?: boolean; mode?: string }) => {
+  .option('--parallel', 'Force worker-thread parsing even for tiny repositories')
+  .option('--no-parallel', 'Disable worker-thread parsing; auto mode uses workers for normal/large repos')
+  .option('--jobs <n>', 'Worker thread count when worker parsing is active (default: cores - 1, capped at 8)')
+  .action(async (repoPath: string, opts: { db?: string; verbose?: boolean; reset?: boolean; maxFileKb: string; includeVendor?: boolean; includeGenerated?: boolean; mode?: string; parallel?: boolean; jobs?: string }) => {
     const absRepo = path.resolve(repoPath);
     if (!fs.existsSync(absRepo)) {
       console.error(`Path not found: ${absRepo}`);
@@ -63,6 +69,9 @@ program
       const maxKb = parseInt(opts.maxFileKb, 10);
       const maxFileBytes = isNaN(maxKb) || maxKb <= 0 ? 0 : maxKb * 1024;
       const mode = parseMode(opts.mode);
+      // `--parallel` / `--no-parallel` force the parser mode; otherwise the
+      // indexer uses auto mode (workers for normal/large repos, serial for tiny).
+      const jobsN = opts.jobs ? parseInt(opts.jobs, 10) : undefined;
       const result = await indexer.indexDirectory(absRepo, {
         verbose: opts.verbose,
         reset: opts.reset,
@@ -70,6 +79,8 @@ program
         includeVendor: opts.includeVendor,
         includeGenerated: opts.includeGenerated,
         mode,
+        parallel: opts.parallel,
+        jobs: jobsN != null && !isNaN(jobsN) && jobsN > 0 ? jobsN : undefined,
       });
       console.log(`\n  ✓ Indexed ${result.filesIndexed.toLocaleString()} files`);
       if (result.filesReusedFromCache > 0) console.log(`    ${result.filesReusedFromCache.toLocaleString()} reused from cache`);
@@ -267,6 +278,119 @@ program
     } finally { store.close(); }
   });
 
+// ── seer service-calls / service-links / trace-service ──────────────────────
+
+program
+  .command('service-calls')
+  .description('List outbound HTTP/service client calls detected in the codebase')
+  .option('--db <path>', 'Database path')
+  .option('--protocol <p>', 'Filter by protocol (http)')
+  .option('--method <m>', 'Filter by HTTP method (GET/POST/...)')
+  .option('--framework <f>', 'Filter by client framework (fetch/axios/requests/...)')
+  .option('--path <substr>', 'Filter by normalized path substring')
+  .option('--min-confidence <c>', 'Minimum confidence 0..1', '0')
+  .option('-n, --limit <n>', 'Max results', '100')
+  .option('--offset <n>', 'Skip first N results', '0')
+  .action((opts: {
+    db?: string; protocol?: string; method?: string; framework?: string;
+    path?: string; minConfidence: string; limit: string; offset: string;
+  }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const rows = store.listServiceCalls({
+        protocol: opts.protocol,
+        method: opts.method,
+        framework: opts.framework,
+        pathSubstr: opts.path,
+        minConfidence: parseFloat(opts.minConfidence) || 0,
+        limit: parseInt(opts.limit, 10) || 100,
+        offset: parseInt(opts.offset, 10) || 0,
+      });
+      if (rows.length === 0) { console.log('No service calls found.'); return; }
+      console.log(`\nService calls (${rows.length} shown)\n`);
+      for (const r of rows) {
+        const caller = r.callerQualifiedName ?? r.callerName ?? '(module-level)';
+        const target = r.normalizedPath ?? r.rawTarget;
+        const host = r.hostHint ? ` host=${r.hostHint}` : '';
+        const env = r.envKey ? ` env=${r.envKey}` : '';
+        console.log(`  ${(r.method ?? 'ANY').padEnd(6)} ${target.padEnd(40)} ` +
+          `${r.framework.padEnd(12)} ${caller.padEnd(28)} ${r.filePath}:${r.line + 1}${host}${env}`);
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('service-links')
+  .description('List deterministic service-link rendezvous between client calls and route handlers')
+  .option('--db <path>', 'Database path')
+  .option('--protocol <p>', 'Filter by protocol (http)')
+  .option('--method <m>', 'Filter by HTTP method')
+  .option('--path <substr>', 'Filter by call/route path substring')
+  .option('--match-kind <k>', 'Filter by match_kind (literal_path/env_base/route_pattern)')
+  .option('--min-confidence <c>', 'Minimum confidence 0..1', '0')
+  .option('-n, --limit <n>', 'Max results', '100')
+  .option('--offset <n>', 'Skip first N results', '0')
+  .action((opts: {
+    db?: string; protocol?: string; method?: string; path?: string;
+    matchKind?: string; minConfidence: string; limit: string; offset: string;
+  }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const rows = store.listServiceLinks({
+        protocol: opts.protocol,
+        method: opts.method,
+        pathSubstr: opts.path,
+        matchKind: opts.matchKind,
+        minConfidence: parseFloat(opts.minConfidence) || 0,
+        limit: parseInt(opts.limit, 10) || 100,
+        offset: parseInt(opts.offset, 10) || 0,
+      });
+      if (rows.length === 0) { console.log('No service links found.'); return; }
+      console.log(`\nService links (${rows.length} shown)\n`);
+      for (const r of rows) {
+        const caller = r.callerQualifiedName ?? r.callerName ?? '(module-level)';
+        const handler = r.handlerQualifiedName ?? r.handlerName ?? '(no handler)';
+        const route = r.routePath ?? r.callNormalizedPath ?? r.callRawTarget;
+        console.log(
+          `  ${(r.callMethod ?? 'ANY').padEnd(6)} ${(route ?? '').padEnd(36)} ` +
+          `${caller.padEnd(22)} → ${handler.padEnd(22)} ` +
+          `[${r.matchKind} ${r.confidence.toFixed(2)}]`,
+        );
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('trace-service <from> <to>')
+  .description('Find a shortest service-link path between two symbols (bounded BFS)')
+  .option('--db <path>', 'Database path')
+  .option('--depth <n>', 'Max BFS depth', '6')
+  .action((from: string, to: string, opts: { db?: string; depth: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const fromRows = store.getDefinition(from);
+      const toRows   = store.getDefinition(to);
+      if (fromRows.length === 0) { console.log(`Source symbol "${from}" not found.`); return; }
+      if (toRows.length === 0)   { console.log(`Target symbol "${to}" not found.`);   return; }
+      const path = store.traceServicePath(
+        fromRows[0].id, toRows[0].id,
+        parseInt(opts.depth, 10) || 6,
+      );
+      if (path.length === 0) { console.log('No service-link path found.'); return; }
+      console.log(`\nService path (${path.length} hops):\n`);
+      for (const id of path) {
+        const row = store.rawDb().prepare(
+          `SELECT qualified_name, name FROM symbols WHERE id = ?`
+        ).get(id) as { qualified_name: string | null; name: string } | undefined;
+        const label = row?.qualified_name ?? row?.name ?? `#${id}`;
+        console.log(`  → ${label}`);
+      }
+    } finally { store.close(); }
+  });
+
 // ── seer deps ────────────────────────────────────────────────────────────────
 
 program
@@ -386,6 +510,34 @@ program
     } finally { store.close(); }
   });
 
+// ── seer continuity (rename/move continuity evidence) ────────────────────
+
+program
+  .command('continuity <symbol>')
+  .description('v10 — Show rename/move continuity evidence (advisory; confidence-labelled).')
+  .option('--db <path>', 'Database path')
+  .action(async (symbol: string, opts: { db?: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const { getContinuityForSymbol } = await import('../indexer/continuity.js');
+      const defs = store.getDefinition(symbol);
+      if (defs.length === 0) { console.log(`No symbol "${symbol}"`); return; }
+      for (const d of defs.slice(0, 3)) {
+        console.log(`\n${d.qualifiedName ?? d.name}  (${d.kind})  ${d.filePath}:${d.lineStart + 1}`);
+        const rows = getContinuityForSymbol(store, d.id);
+        if (rows.length === 0) {
+          console.log(`  (no continuity candidates)`);
+          continue;
+        }
+        for (const r of rows) {
+          console.log(`  ← previous: ${r.previousName.padEnd(28)} conf=${r.confidence.toFixed(2)}  [${r.matchReasons.join(', ')}]`);
+          console.log(`     in:       ${r.previousFile}`);
+        }
+      }
+    } finally { store.close(); }
+  });
+
 // ── seer architecture ──────────────────────────────────────────────────────
 
 program
@@ -449,6 +601,528 @@ program
         }
       }
       console.log(`\n  ${r.elapsedMs}ms`);
+    } finally { store.close(); }
+  });
+
+// ── Track-E: modules / behavior / risk / context ──────────────────────────
+
+program
+  .command('modules')
+  .description('List clustered modules (Louvain) by centrality / size / label')
+  .option('--db <path>', 'Database path')
+  .option('-n, --limit <n>', 'Max results', '40')
+  .option('--sort <by>', 'centrality | size | label', 'centrality')
+  .action((opts: { db?: string; limit: string; sort: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const sortBy = opts.sort === 'size' || opts.sort === 'label' ? opts.sort : 'centrality';
+      const rows = store.listModules({ limit: parseInt(opts.limit, 10) || 40, sortBy });
+      if (rows.length === 0) { console.log('No modules — run `seer index` to build the clustering.'); return; }
+      console.log(`\nModules (${rows.length} shown, sorted by ${sortBy})\n`);
+      console.log(`  ${'Label'.padEnd(28)} ${'Files'.padStart(5)} ${'Symbols'.padStart(7)} ${'Lang'.padEnd(12)} ${'Cohesion'.padStart(8)} ${'Central'.padStart(8)}`);
+      console.log('  ' + '─'.repeat(80));
+      for (const m of rows) {
+        console.log(
+          `  ${m.label.padEnd(28)} ${String(m.sizeFiles).padStart(5)} ${String(m.sizeSymbols).padStart(7)} ${(m.primaryLanguage ?? '').padEnd(12)} ${m.cohesion.toFixed(2).padStart(8)} ${m.centrality.toFixed(4).padStart(8)}`,
+        );
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('module <label>')
+  .description('Show files and top symbols inside a module (by label or id)')
+  .option('--db <path>', 'Database path')
+  .option('-n, --files <n>', 'Max files', '50')
+  .option('-s, --symbols <n>', 'Max symbols', '20')
+  .action((label: string, opts: { db?: string; files: string; symbols: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const asId = parseInt(label, 10);
+      const mod = !isNaN(asId) && String(asId) === label
+        ? store.getModuleById(asId)
+        : store.getModuleByLabel(label);
+      if (!mod) { console.log(`No module "${label}"`); return; }
+      console.log(`\nModule "${mod.label}"  id=${mod.id}  files=${mod.sizeFiles}  symbols=${mod.sizeSymbols}  cohesion=${mod.cohesion.toFixed(2)}  centrality=${mod.centrality.toFixed(4)}`);
+      const files = store.listModuleMembers(mod.id, parseInt(opts.files, 10) || 50);
+      console.log(`\n  Files (${files.length}):`);
+      for (const f of files) console.log(`    ${f.language.padEnd(12)} ${f.role.padEnd(9)} ${f.relPath}`);
+      const syms = store.listModuleTopSymbols(mod.id, parseInt(opts.symbols, 10) || 20);
+      console.log(`\n  Top symbols (${syms.length}):`);
+      for (const s of syms) console.log(`    ${s.pagerank.toFixed(4)}  ${(s.qualifiedName ?? s.name).padEnd(40)} ${s.kind}  ${s.filePath}`);
+      const out = store.moduleDependencies(mod.id, { direction: 'out', limit: 10 });
+      const inn = store.moduleDependencies(mod.id, { direction: 'in', limit: 10 });
+      if (out.length > 0) {
+        console.log(`\n  Depends on (out):`);
+        for (const d of out) console.log(`    ${d.label.padEnd(28)} kind=${d.kind.padEnd(8)} weight=${d.weight}`);
+      }
+      if (inn.length > 0) {
+        console.log(`\n  Depended on by (in):`);
+        for (const d of inn) console.log(`    ${d.label.padEnd(28)} kind=${d.kind.padEnd(8)} weight=${d.weight}`);
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('behavior <symbol>')
+  .description('Show ranked behavioral contract (tests) for a symbol')
+  .option('--db <path>', 'Database path')
+  .option('-n, --limit <n>', 'Max results', '20')
+  .option('--depth <n>', 'BFS depth for indirect coverage', '2')
+  .action((symbol: string, opts: { db?: string; limit: string; depth: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const r = rankedBehavior(store, symbol, {
+        limit: parseInt(opts.limit, 10) || 20,
+        indirectDepth: parseInt(opts.depth, 10) || 2,
+      });
+      if (!r) { console.log(`No symbol "${symbol}"`); return; }
+      console.log(`\nBehavior for ${r.symbol.qualifiedName ?? r.symbol.name}  (${r.symbol.kind})  ${r.symbol.file}`);
+      console.log(`  direct=${r.direct}  indirect=${r.indirect}  naming=${r.namingMatches}  same-file=${r.sameFileMatches}\n`);
+      for (const t of r.tests) {
+        const dist = t.graphDistance == null ? '  ' : String(t.graphDistance).padStart(2);
+        console.log(
+          `  spec=${t.specificity.toString().padStart(4)} d=${dist} asserts=${String(t.assertionCount).padStart(2)} ${t.relationship.padEnd(18)} ${(t.testSymbol.qualifiedName ?? t.testSymbol.name).padEnd(40)} ${t.testSymbol.file}:${t.testSymbol.lineStart + 1}`,
+        );
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('risk <symbol>')
+  .description('Deterministic edit-risk profile for a symbol')
+  .option('--db <path>', 'Database path')
+  .option('--depth <n>', 'BFS depth for transitive callers', '3')
+  .action((symbol: string, opts: { db?: string; depth: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const r = computeRisk(store, symbol, { callerDepth: parseInt(opts.depth, 10) || 3 });
+      if (!r) { console.log(`No symbol "${symbol}"`); return; }
+      console.log(`\nRisk: ${r.risk.toUpperCase()} (score ${r.score.toFixed(2)})`);
+      console.log(`  ${r.symbol.qualifiedName ?? r.symbol.name}  (${r.symbol.kind})  ${r.symbol.file}:${r.symbol.lineStart + 1}`);
+      if (r.module) console.log(`  module=${r.module.label}`);
+      console.log(`\n  Signal contributions:`);
+      for (const c of r.signalContributions) {
+        const sign = c.contribution > 0 ? '+' : '';
+        console.log(`    ${c.signal.padEnd(28)} value=${String(c.value).padEnd(8)} ${sign}${c.contribution.toFixed(2)}`);
+      }
+      if (r.signals.routes.length > 0) {
+        console.log(`  Routes:`);
+        for (const rt of r.signals.routes) console.log(`    ${rt.method} ${rt.path} (${rt.framework})`);
+      }
+    } finally { store.close(); }
+  });
+
+program
+  .command('context <symbol>')
+  .description('One compact pre-edit packet: definition, callers, callees, routes, config, behavior, history, complexity, module, blast radius, risk')
+  .option('--db <path>', 'Database path')
+  .option('--file <path>', 'Disambiguate by file')
+  .action((symbol: string, opts: { db?: string; file?: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const c = buildContext(store, symbol, { filePath: opts.file });
+      if (!c) { console.log(`No symbol "${symbol}"`); return; }
+      console.log(`\nContext for ${c.symbol.qualifiedName ?? c.symbol.name}  (${c.symbol.kind})  ${c.symbol.file}:${c.symbol.lineStart + 1}`);
+      if (c.module) console.log(`  Module: ${c.module.label}`);
+      console.log(`  Complexity: loc=${c.complexity.loc ?? '—'}  cyclomatic=${c.complexity.cyclomatic ?? '—'}  cognitive=${c.complexity.cognitive ?? '—'}`);
+      console.log(`  Callers: ${c.callers.total} total; Callees: ${c.callees.total}; Blast radius (depth ${c.blastRadius.maxDepth}): direct=${c.blastRadius.directCallers}, transitive=${c.blastRadius.transitiveCallers}`);
+      console.log(`  Behavior: direct=${c.behavior.direct}  indirect=${c.behavior.indirect}  naming=${c.behavior.namingMatches}  same-file=${c.behavior.sameFileMatches}`);
+      console.log(`  Routes: ${c.routes.length}  Config: ${c.configKeys.length}  History: ${c.recentHistory.total}`);
+      console.log(`  Risk: ${c.risk.risk.toUpperCase()} (score ${c.risk.score.toFixed(2)})`);
+      console.log(`\n  Signal contributions:`);
+      for (const sc of c.risk.signalContributions) {
+        const sign = sc.contribution > 0 ? '+' : '';
+        console.log(`    ${sc.signal.padEnd(28)} ${sign}${sc.contribution.toFixed(2)}`);
+      }
+    } finally { store.close(); }
+  });
+
+// ── Track-F: bundle export/import + CI pipeline ──────────────────────────
+
+const bundleCmd = program
+  .command('bundle')
+  .description('Portable .seer index bundles (export, import, info)');
+
+bundleCmd
+  .command('export')
+  .description('Export the current index as a portable .seerbundle file')
+  .option('--workspace <path>', 'Workspace path (defaults to cwd)')
+  .option('--db <path>', 'Database path')
+  .option('--out <path>', 'Output bundle path (default: <workspace>/.seer/index.seerbundle)')
+  .option('--level <n>', 'Gzip compression level 0-9 (default: 6)', '6')
+  .option('--built-at <ms>', 'Pin manifest.builtAt to a fixed Unix-millis value for reproducible bundles')
+  .action(async (opts: { workspace?: string; db?: string; out?: string; level: string; builtAt?: string }) => {
+    const workspace = path.resolve(opts.workspace ?? process.cwd());
+    const dbPath = opts.db ?? path.join(workspace, '.seer', 'graph.db');
+    const { exportBundle } = await import('../bundle/export.js');
+    const level = Math.max(0, Math.min(9, parseInt(opts.level, 10) || 6));
+    const builtAt = opts.builtAt ? parseInt(opts.builtAt, 10) : undefined;
+    const r = await exportBundle(dbPath, workspace, {
+      out: opts.out, compressionLevel: level,
+      builtAt: (builtAt != null && !isNaN(builtAt)) ? builtAt : undefined,
+      log: (m) => console.log(`  ${m}`),
+    });
+    console.log(`\n  ✓ Bundle exported to ${r.bundlePath}`);
+    console.log(`    ${r.bytes.toLocaleString()} bytes  schemaVersion=${r.manifest.schemaVersion}  symbols=${r.manifest.index.symbols}  edges=${r.manifest.index.edges}`);
+    console.log(`    DB sha256=${r.manifest.dbSha256.slice(0, 16)}...  built in ${r.elapsedMs}ms`);
+  });
+
+bundleCmd
+  .command('import <bundle>')
+  .description('Import a .seerbundle into a workspace. Add --external to import additively as a peer-repo evidence layer (does not replace the local DB).')
+  .option('--workspace <path>', 'Workspace path (defaults to cwd)')
+  .option('--db <path>', 'Database path (default: <workspace>/.seer/graph.db)')
+  .option('--overwrite', 'Allow overwriting an existing index')
+  .option('--skip-integrity-check', 'Skip sha256 check (forensics only)')
+  .option('--skip-schema-check', 'Skip schemaVersion compatibility check (use only if you KNOW the bundle is safe)')
+  .option('--external', 'Additive external import — adds routes/service endpoints as a read-only external layer, never replaces local rows.')
+  .option('--alias <name>', 'Optional alias for the external bundle (defaults to manifest.gitBranch or filename).')
+  .option('--force', 'Force re-import even if the same hash is already present (external mode only).')
+  .action(async (bundle: string, opts: { workspace?: string; db?: string; overwrite?: boolean; skipIntegrityCheck?: boolean; skipSchemaCheck?: boolean; external?: boolean; alias?: string; force?: boolean }) => {
+    const workspace = path.resolve(opts.workspace ?? process.cwd());
+    if (opts.external) {
+      const dbPath = opts.db ?? path.join(workspace, '.seer', 'graph.db');
+      if (!fs.existsSync(dbPath)) {
+        console.error(`No index at ${dbPath}. Run "seer index <path>" first before importing an external bundle.`);
+        process.exit(1);
+      }
+      const { importExternalBundle } = await import('../bundle/external.js');
+      const store = new Store(dbPath);
+      try {
+        const r = await importExternalBundle(path.resolve(bundle), store, {
+          alias: opts.alias, force: opts.force,
+          log: (m) => console.log(`  ${m}`),
+        });
+        if (r.alreadyImported) {
+          console.log(`\n  ↻ External bundle already imported (hash unchanged); no-op.`);
+        } else {
+          console.log(`\n  ✓ External bundle imported as layer #${r.bundleId} (${r.externalProject ?? 'unnamed'}).`);
+          console.log(`    routes=${r.routesImported}  serviceEndpoints=${r.serviceEndpointsImported}  schemaVersion=${r.schemaVersion}`);
+          console.log(`    hash=${r.externalHash.slice(0, 12)}...  took ${r.elapsedMs}ms`);
+        }
+      } catch (err) {
+        console.error(`\n  ✗ External import failed: ${(err as Error).message}`);
+        process.exit(1);
+      } finally { store.close(); }
+      return;
+    }
+    const { importBundle } = await import('../bundle/import.js');
+    try {
+      const r = await importBundle(path.resolve(bundle), {
+        repoRoot: workspace,
+        dbOut: opts.db,
+        overwrite: opts.overwrite,
+        skipIntegrityCheck: opts.skipIntegrityCheck,
+        skipSchemaCheck: opts.skipSchemaCheck,
+        log: (m) => console.log(`  ${m}`),
+      });
+      console.log(`\n  ✓ Bundle imported to ${r.dbPath}`);
+      console.log(`    builtAt=${new Date(r.manifest.builtAt).toISOString()}  schemaVersion=${r.manifest.schemaVersion}`);
+      console.log(`    symbols=${r.manifest.index.symbols}  edges=${r.manifest.index.edges}  modules=${r.manifest.index.modules}`);
+      console.log(`    Took ${r.elapsedMs}ms`);
+    } catch (err) {
+      console.error(`\n  ✗ Import failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ── seer boundaries (Feature 4: monorepo boundary detection) ─────────────
+
+program
+  .command('boundaries')
+  .description('List monorepo package/service boundaries detected at index time.')
+  .option('--db <path>', 'Database path')
+  .option('-n, --limit <n>', 'Max results', '50')
+  .action((opts: { db?: string; limit: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const rows = store.listBoundaries(parseInt(opts.limit, 10) || 50);
+      if (rows.length === 0) {
+        console.log('No boundaries detected — workspace has no nested package manifests or convention dirs.');
+        return;
+      }
+      console.log(`\nBoundaries (${rows.length} shown)\n`);
+      for (const b of rows) {
+        const eco = b.ecosystem ? `[${b.ecosystem}]` : '';
+        console.log(`  ${b.kind.padEnd(16)} ${String(b.sizeFiles).padStart(5)}  ${b.label.padEnd(20)} ${eco}  ${b.rootRelPath || '.'}`);
+      }
+    } finally { store.close(); }
+  });
+
+// ── seer preflight ────────────────────────────────────────────────────────
+
+program
+  .command('preflight')
+  .description('One compact "should I edit this?" evidence packet for an agent. Pass --symbol <X> for a single-symbol packet, or --from <ref> --to <ref> for a diff-range packet.')
+  .option('--db <path>', 'Database path')
+  .option('--workspace <path>', 'Workspace path (defaults to cwd)')
+  .option('--symbol <name>', 'Build a packet for the named symbol.')
+  .option('--file <path>', 'Optional file to disambiguate the symbol.')
+  .option('--from <ref>', 'Build a range packet from this git ref.')
+  .option('--to <ref>', 'Build a range packet to this git ref.')
+  .option('--old-bundle <path>', 'Optional old .seerbundle to include contract changes.')
+  .option('--new-bundle <path>', 'Optional new .seerbundle to include contract changes.')
+  .option('--max-symbols <n>', 'Cap on touched symbols (default 12)', '12')
+  .option('--max-tests <n>',   'Cap on likely tests (default 8)',   '8')
+  .option('--max-history <n>', 'Cap on history rows (default 8)',   '8')
+  .option('--json', 'Print machine-readable JSON.')
+  .action(async (opts: {
+    db?: string; workspace?: string;
+    symbol?: string; file?: string;
+    from?: string; to?: string;
+    oldBundle?: string; newBundle?: string;
+    maxSymbols: string; maxTests: string; maxHistory: string;
+    json?: boolean;
+  }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const workspace = path.resolve(opts.workspace ?? process.cwd());
+    const store = openStore(dbPath);
+    try {
+      const { preflight } = await import('../indexer/preflight.js');
+      const r = await preflight(store, {
+        symbol: opts.symbol,
+        filePath: opts.file,
+        fromRef: opts.from,
+        toRef: opts.to,
+        workspace,
+        oldBundle: opts.oldBundle,
+        newBundle: opts.newBundle,
+        maxSymbols: parseInt(opts.maxSymbols, 10) || 12,
+        maxTests: parseInt(opts.maxTests, 10) || 8,
+        maxHistory: parseInt(opts.maxHistory, 10) || 8,
+      });
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+      } else {
+        printPreflight(r);
+      }
+      // Advisory: never raise non-zero exit when preflight finds risk.
+      process.exit(r.ok ? 0 : 1);
+    } finally { store.close(); }
+  });
+
+function printPreflight(r: import('../indexer/preflight.js').PreflightResult): void {
+  if (!r.ok) {
+    console.log(`\n  ✗ preflight failed: ${r.reason}`);
+    return;
+  }
+  console.log(`\nPreflight (${r.mode})`);
+  if (r.symbol) {
+    console.log(`  Symbol:   ${r.symbol.qualifiedName ?? r.symbol.name}  ${r.symbol.file}:${r.symbol.lineStart + 1}`);
+  }
+  if (r.range) {
+    console.log(`  Range:    ${r.range.fromRef ?? '(working tree)'} → ${r.range.toRef ?? 'HEAD'}`);
+    console.log(`            ${r.range.changedFiles} file(s), ${r.range.directHunkCount} hunk(s)`);
+  }
+  console.log(`  Risk:     ${r.risk.overall.toUpperCase()}`);
+  for (const r2 of r.risk.perSymbol.slice(0, 5)) {
+    console.log(`    - ${r2.symbol.qualifiedName ?? r2.symbol.name}  score=${r2.score.toFixed(2)}  ${r2.risk}`);
+  }
+  if (r.likelyTests.length > 0) {
+    console.log(`  Likely tests (${r.likelyTests.length}):`);
+    for (const t of r.likelyTests.slice(0, 8)) {
+      console.log(`    • ${(t.testSymbol.qualifiedName ?? t.testSymbol.name).padEnd(40)} [${t.relationship}]  spec=${t.specificity}`);
+    }
+  }
+  if (r.serviceImpact.inbound.length + r.serviceImpact.outbound.length > 0) {
+    console.log(`  Service impact: in=${r.serviceImpact.inbound.length} out=${r.serviceImpact.outbound.length}`);
+  }
+  if (r.history.length > 0) {
+    console.log(`  Recent commits (${r.history.length}):`);
+    for (const h of r.history.slice(0, 5)) {
+      const date = new Date(h.committedAt * 1000).toISOString().slice(0, 10);
+      console.log(`    ${h.sha.slice(0, 8)}  ${date}  ${(h.author ?? '?').slice(0, 24).padEnd(24)} ${(h.message ?? '').split('\n')[0].slice(0, 60)}`);
+    }
+  }
+  if (r.warnings.length > 0) {
+    console.log(`  Warnings:`);
+    for (const w of r.warnings) console.log(`    ⚠  ${w}`);
+  }
+}
+
+// ── seer contract diff ────────────────────────────────────────────────────
+
+const contractCmd = program
+  .command('contract')
+  .description('API/service contract diffing across exported .seerbundle files (advisory).');
+
+contractCmd
+  .command('diff <old-bundle> <new-bundle>')
+  .description('Diff API/service contracts (routes, tRPC/GraphQL/gRPC ops, topics, queues) between two bundles. Exit 0 even when breaking changes appear — advisory only.')
+  .option('--json', 'Emit machine-readable JSON instead of a compact table.')
+  .option('--include-callers', 'Include affectedCallers using service-link evidence from both bundles.')
+  .action(async (oldBundle: string, newBundle: string, opts: { json?: boolean; includeCallers?: boolean }) => {
+    const { contractDiff, formatContractDiffTable } = await import('../bundle/contract.js');
+    try {
+      const diff = await contractDiff(
+        path.resolve(oldBundle),
+        path.resolve(newBundle),
+        { includeAffectedCallers: opts.includeCallers },
+      );
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(diff, null, 2) + '\n');
+      } else {
+        process.stdout.write(formatContractDiffTable(diff));
+      }
+      // Advisory: always exit 0.
+      process.exit(0);
+    } catch (err) {
+      console.error(`\n  ✗ contract diff failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+bundleCmd
+  .command('external')
+  .description('List external bundle layers imported into this workspace.')
+  .option('--db <path>', 'Database path')
+  .action((opts: { db?: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const rows = store.listExternalBundles();
+      if (rows.length === 0) {
+        console.log('No external bundles imported.');
+        return;
+      }
+      console.log(`\nExternal bundle layers (${rows.length}):\n`);
+      for (const r of rows) {
+        console.log(`  #${r.id}  ${r.externalProject ?? '(unnamed)'}  routes=${r.routesImported}`);
+        console.log(`     path=${r.bundlePath}`);
+        console.log(`     hash=${(r.externalHash ?? '').slice(0, 12)}...  imported=${new Date(r.importedAt).toISOString()}`);
+      }
+    } finally { store.close(); }
+  });
+
+bundleCmd
+  .command('info <bundle>')
+  .description('Show a bundle\'s manifest without unpacking the DB')
+  .action(async (bundle: string) => {
+    const { readBundleManifest } = await import('../bundle/import.js');
+    try {
+      const manifest = readBundleManifest(path.resolve(bundle));
+      console.log(JSON.stringify(manifest, null, 2));
+    } catch (err) {
+      console.error(`\n  ✗ ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+const ciCmd = program
+  .command('ci')
+  .description('CI helpers: bundle generation, workflow templates');
+
+ciCmd
+  .command('bundle')
+  .description('Fresh-index the repo and emit a portable bundle (designed for CI)')
+  .option('--workspace <path>', 'Repo to index (defaults to cwd)')
+  .option('--out <path>', 'Output path (default: <workspace>/.seer/index.seerbundle)')
+  .option('--mode <mode>', 'Discovery mode: full | standard | fast (default: standard)', 'standard')
+  .option('--no-reset', 'Keep existing DB before indexing (default: wipe)')
+  .option('--no-parallel', 'Disable parallel parsing')
+  .option('--git-head <sha>', 'Override gitHead in the manifest')
+  .option('--git-branch <name>', 'Override gitBranch in the manifest')
+  .option('--built-at <ms>', 'Pin manifest.builtAt to a fixed Unix-millis value for reproducible bundles')
+  .action(async (opts: { workspace?: string; out?: string; mode?: string; reset?: boolean; parallel?: boolean; gitHead?: string; gitBranch?: string; builtAt?: string }) => {
+    const workspace = path.resolve(opts.workspace ?? process.cwd());
+    const { buildCiBundle } = await import('../bundle/ci.js');
+    try {
+      const builtAt = opts.builtAt ? parseInt(opts.builtAt, 10) : undefined;
+      const r = await buildCiBundle({
+        repoRoot: workspace, out: opts.out,
+        mode: parseMode(opts.mode),
+        reset: opts.reset, parallel: opts.parallel,
+        gitHead: opts.gitHead, gitBranch: opts.gitBranch,
+        builtAt: (builtAt != null && !isNaN(builtAt)) ? builtAt : undefined,
+      });
+      console.log(`\n  ✓ CI bundle: ${r.bundle.bundlePath}`);
+      console.log(`    ${r.index.symbols.toLocaleString()} symbols / ${r.index.edges.toLocaleString()} edges in ${r.totalElapsedMs}ms`);
+    } catch (err) {
+      console.error(`\n  ✗ CI bundle failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+ciCmd
+  .command('workflow')
+  .description('Emit a ready-to-paste GitHub Actions workflow that builds a bundle on push')
+  .action(async () => {
+    const { workflowTemplate } = await import('../bundle/ci.js');
+    process.stdout.write(workflowTemplate());
+  });
+
+// ── Track-F: SCIP import ────────────────────────────────────────────────
+
+program
+  .command('scip-import <scip-path>')
+  .description('Import a SCIP precision index. Adds source-labelled precise edges over the tree-sitter baseline.')
+  .option('--workspace <path>', 'Workspace path (defaults to cwd)')
+  .option('--db <path>', 'Database path')
+  .option('--require-file-in-index', 'Skip SCIP docs whose file isn\'t already indexed (default: on)')
+  .option('--no-require-file-in-index', 'Accept SCIP docs for files outside the tree-sitter index')
+  .action(async (scipPath: string, opts: { workspace?: string; db?: string; requireFileInIndex?: boolean }) => {
+    const workspace = path.resolve(opts.workspace ?? process.cwd());
+    const dbPath = opts.db ?? path.join(workspace, '.seer', 'graph.db');
+    if (!fs.existsSync(dbPath)) {
+      console.error(`No index at ${dbPath}. Run "seer index <path>" first.`);
+      process.exit(1);
+    }
+    const { importScip } = await import('../scip/import.js');
+    const store = new Store(dbPath);
+    try {
+      const r = await importScip(path.resolve(scipPath), store, {
+        repoRoot: workspace,
+        requireFileInIndex: opts.requireFileInIndex ?? true,
+        log: (m) => console.log(`  ${m}`),
+      });
+      console.log(`\n  ✓ SCIP import done in ${r.elapsedMs}ms`);
+      console.log(`    docs=${r.documentsProcessed}  symbols=${r.symbolsInserted} new, ${r.symbolsMerged} merged`);
+      console.log(`    edges=${r.edgesInserted}  filesMissing=${r.filesMissing}`);
+      console.log(`    tool=${r.tool ?? '—'}  sha=${r.sha256.slice(0, 12)}...`);
+    } finally { store.close(); }
+  });
+
+// ── Track-F: duplicate detection ────────────────────────────────────────
+
+program
+  .command('duplicates')
+  .alias('dupes')
+  .description('Find clusters of structurally-similar functions (SimHash)')
+  .option('--db <path>', 'Database path')
+  .option('--max-distance <n>', 'Max Hamming distance for two symbols to cluster (default: 6)', '6')
+  .option('--min-loc <n>', 'Minimum lines-of-code to consider (default: 4)', '4')
+  .option('--include-tests', 'Include test files (off by default)')
+  .option('-n, --limit <n>', 'Max clusters to show', '40')
+  .action(async (opts: { db?: string; maxDistance: string; minLoc: string; includeTests?: boolean; limit: string }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const { findDuplicates } = await import('../indexer/shapehash.js');
+      const clusters = findDuplicates(store, {
+        maxDistance: parseInt(opts.maxDistance, 10) || 6,
+        minLoc: parseInt(opts.minLoc, 10) || 4,
+        includeTests: opts.includeTests,
+        maxClusters: parseInt(opts.limit, 10) || 40,
+      });
+      if (clusters.length === 0) {
+        console.log('No duplicate clusters found (have you run `seer index`? — shape hashes are built during indexing).');
+        return;
+      }
+      console.log(`\nFound ${clusters.length} duplicate cluster(s):\n`);
+      for (const c of clusters) {
+        console.log(`  Cluster (${c.symbols.length} symbols, fingerprint=${c.fingerprint.toString(16).slice(0, 8)}...)`);
+        for (const s of c.symbols) {
+          console.log(`    [d=${s.hammingFromAnchor.toString().padStart(2)}]  ${(s.qualifiedName ?? s.name).padEnd(40)} ${s.kind.padEnd(10)} loc=${(s.loc ?? '?').toString().padStart(3)}  ${s.file}:${s.lineStart + 1}`);
+        }
+        console.log();
+      }
     } finally { store.close(); }
   });
 

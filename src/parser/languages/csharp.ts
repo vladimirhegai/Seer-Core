@@ -1,7 +1,25 @@
 import type Parser from 'web-tree-sitter';
-import type { SymbolDef, SymbolKind } from '../../types.js';
+import type { SymbolDef, SymbolKind, ServiceCallDef } from '../../types.js';
 import type { LanguageExtractor } from '../walker.js';
 import { firstLine } from '../walker.js';
+
+// C# HttpClient async method names → HTTP verb.
+const CS_HTTP_CLIENT_METHODS = new Map<string, string>([
+  ['GetAsync', 'GET'], ['GetStringAsync', 'GET'], ['GetByteArrayAsync', 'GET'],
+  ['GetStreamAsync', 'GET'], ['GetFromJsonAsync', 'GET'],
+  ['PostAsync', 'POST'], ['PostAsJsonAsync', 'POST'],
+  ['PutAsync', 'PUT'], ['PutAsJsonAsync', 'PUT'],
+  ['PatchAsync', 'PATCH'],
+  ['DeleteAsync', 'DELETE'],
+  ['SendAsync', 'ANY'],
+]);
+
+function csLooksLikeHttpTarget(s: string): boolean {
+  if (!s) return false;
+  if (s.startsWith('/')) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  return false;
+}
 
 /**
  * C# extractor — covers .cs files. Common in Godot (since Godot 4 supports
@@ -153,6 +171,54 @@ export const csharpExtractor: LanguageExtractor = {
       }
     }
     return null;
+  },
+
+  /**
+   * C# HttpClient calls: client.GetAsync("/api/x"), httpClient.PostAsJsonAsync(url, body).
+   * The first string-literal arg is taken as the URL.
+   */
+  tryExtractServiceCalls(node: Parser.SyntaxNode): ServiceCallDef[] | null {
+    if (node.type !== 'invocation_expression') return null;
+    const fn = node.childForFieldName('function');
+    if (!fn || fn.type !== 'member_access_expression') return null;
+    const name = fn.childForFieldName('name')?.text;
+    if (!name) return null;
+    const verb = CS_HTTP_CLIENT_METHODS.get(name);
+    if (!verb) return null;
+
+    const args = node.childForFieldName('arguments');
+    if (!args) return null;
+    // arguments → argument_list with `argument` children, each wrapping an expr.
+    let first: Parser.SyntaxNode | null = null;
+    for (const a of args.namedChildren) {
+      if (a.type === 'argument') {
+        first = a.namedChildren[0];
+        break;
+      }
+      first = a; break;
+    }
+    if (!first) return null;
+    let raw: string | null = null;
+    if (first.type === 'string_literal' || first.type === 'verbatim_string_literal') {
+      raw = first.text.replace(/^@?["']|["']$/g, '');
+    } else if (first.type === 'interpolated_string_expression') {
+      // C# interpolated string $"…" — pick the literal_string parts.
+      let text = '';
+      for (const c of first.namedChildren) {
+        if (c.type === 'interpolated_string_text') text += c.text;
+      }
+      if (text) raw = text;
+    }
+    if (!raw || !csLooksLikeHttpTarget(raw)) return null;
+
+    return [{
+      protocol: 'http',
+      method: verb,
+      rawTarget: raw.slice(0, 240),
+      framework: 'HttpClient',
+      line: node.startPosition.row,
+      confidence: 0.85,
+    }];
   },
 };
 

@@ -1,5 +1,5 @@
 import type Parser from 'web-tree-sitter';
-import type { SymbolDef, RouteDef, ConfigKeyRead } from '../../types.js';
+import type { SymbolDef, RouteDef, ConfigKeyRead, ServiceCallDef } from '../../types.js';
 import type { LanguageExtractor } from '../walker.js';
 import { firstLine } from '../walker.js';
 
@@ -20,6 +20,23 @@ const SPRING_REQUEST_ANNOTATIONS: Record<string, string> = {
   PatchMapping: 'PATCH',
   DeleteMapping: 'DELETE',
 };
+
+// Java HTTP CLIENT method names → HTTP verb. RestTemplate exposes a separate
+// method per verb; java.net.http builds the request via .GET()/.POST(…).
+const JAVA_HTTP_CLIENT_METHODS = new Map<string, string>([
+  ['getForObject', 'GET'], ['getForEntity', 'GET'],
+  ['postForObject', 'POST'], ['postForEntity', 'POST'], ['postForLocation', 'POST'],
+  ['put', 'PUT'], ['delete', 'DELETE'],
+  ['exchange', 'ANY'],
+  ['newBuilder', 'ANY'],  // HttpRequest.newBuilder(URI.create("..."))
+]);
+
+function javaLooksLikeHttpTarget(s: string): boolean {
+  if (!s) return false;
+  if (s.startsWith('/')) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  return false;
+}
 
 const JAVA_CANDIDATE_NODE_TYPES = [
   // tryExtractDefinition
@@ -215,6 +232,58 @@ export const javaExtractor: LanguageExtractor = {
       framework: 'spring',
       handlerName,
       line: node.startPosition.row,
+    }];
+  },
+
+  /**
+   * Java HTTP client calls — minimal initial coverage:
+   *   HttpRequest.newBuilder(URI.create("https://x/y"))
+   *     .GET().build()                                  ← yes (path lifted; method=GET)
+   *   restTemplate.getForObject("/api/x", String.class) ← yes (Spring RestTemplate)
+   *   webClient.get().uri("/api/x")                     ← future
+   *
+   * The recognizer is conservative: we accept any method_invocation whose
+   * name is in JAVA_HTTP_CLIENT_METHODS and whose first argument is a string
+   * literal that looks like an HTTP target.
+   */
+  tryExtractServiceCalls(node: Parser.SyntaxNode): ServiceCallDef[] | null {
+    if (node.type !== 'method_invocation') return null;
+    const name = node.childForFieldName('name')?.text;
+    if (!name) return null;
+    const verb = JAVA_HTTP_CLIENT_METHODS.get(name);
+    if (!verb) return null;
+
+    const args = node.childForFieldName('arguments');
+    if (!args) return null;
+    const first = args.namedChildren[0];
+    if (!first) return null;
+    let raw: string | null = null;
+    if (first.type === 'string_literal') {
+      raw = stripJavaQuotes(first.text);
+    } else if (first.type === 'method_invocation') {
+      // URI.create("https://x/y") inside HttpRequest.newBuilder(...)
+      const innerName = first.childForFieldName('name')?.text;
+      const innerObj = first.childForFieldName('object')?.text;
+      if (innerObj === 'URI' && innerName === 'create') {
+        const ia = first.childForFieldName('arguments');
+        const first2 = ia?.namedChildren[0];
+        if (first2?.type === 'string_literal') raw = stripJavaQuotes(first2.text);
+      }
+    }
+    if (!raw || !javaLooksLikeHttpTarget(raw)) return null;
+
+    let framework = 'http-client';
+    const obj = node.childForFieldName('object')?.text;
+    if (obj === 'HttpRequest') framework = 'java.net.http';
+    else if (obj && /(restTemplate|RestTemplate)/.test(obj)) framework = 'spring-rest';
+
+    return [{
+      protocol: 'http',
+      method: verb,
+      rawTarget: raw.slice(0, 240),
+      framework,
+      line: node.startPosition.row,
+      confidence: 0.8,
     }];
   },
 

@@ -12,6 +12,15 @@
  * 7. Large repos spend minutes in test-edge duplicate checks without a
  *    composite edges(from_id, to_id, kind) index
  * 8. Same-file edge resolution needs symbols(file_id, name) for Godot scale
+ * 9. FastAPI @app.post/@app.get decorators mis-detected as outbound
+ *    http-client service_calls (route emitted on the parent decorator node, so
+ *    the walker's node-level de-dup missed it), producing route self-links
+ * 10. TS template-literal path params (`/api/users/${id}`) dropped the dynamic
+ *    segment, collapsing to `/api/users` and breaking route-pattern matching
+ * 11. C++ out-of-line method defs (`Vec<T>::dot`) dropped the class scope from
+ *    the qualified name (`geo.dot` instead of `geo.Vec.dot`) — enhancement
+ * 12. getDefinition `file` filter was exact-match only; a basename couldn't
+ *    disambiguate (`svc.ts` vs `src/svc.ts`) — enhancement
  *
  * Run with: npx tsx tests/bug-regressions.ts
  */
@@ -26,6 +35,7 @@ import { Indexer } from '../src/indexer/index';
 import { collectChurn } from '../src/indexer/churn';
 import { buildSymbolHistory } from '../src/indexer/symbolhistory';
 import { parseFollowLog } from '../src/indexer/git';
+import { resolveServiceLinks } from '../src/indexer/serviceLinks';
 
 let passed = 0;
 let failed = 0;
@@ -104,7 +114,7 @@ async function bug1_v3MigrationBackfill(): Promise<void> {
   const ftsSyms = raw.prepare('SELECT COUNT(*) AS c FROM symbols_fts').get() as { c: number };
   const ftsFiles = raw.prepare('SELECT COUNT(*) AS c FROM files_fts').get() as { c: number };
 
-  assert(s.schemaInfo().dbVersion === 5, `schema migrated to v5 (got ${s.schemaInfo().dbVersion})`);
+  assert(s.schemaInfo().dbVersion === 10, `schema migrated to v9 (got ${s.schemaInfo().dbVersion})`);
   assert(nullKeys.c === 0, `symbol_key backfilled for every pre-v4 symbol (got ${nullKeys.c} NULL)`);
   assert(ftsSyms.c === 2, `symbols_fts rebuilt from existing symbols (got ${ftsSyms.c} rows, expected 2)`);
   assert(ftsFiles.c === 1, `files_fts rebuilt from existing files (got ${ftsFiles.c} rows, expected 1)`);
@@ -437,6 +447,159 @@ function bug8_sameFileResolutionIndex(): void {
   fs.unlinkSync(tmp);
 }
 
+// ── Bug 9: FastAPI @app.post(...) decorator mis-detected as outbound call ───
+// The Python service-call extractor fired on the inner `call` of a decorator
+// (`@app.post("/x")`), emitting a phantom http-client service_call. The route
+// was emitted on the parent `decorator` node, so the walker's node-level
+// route/service-call de-dup never suppressed it. The resolver then self-linked
+// the service's own route to a phantom client call.
+async function bug9_fastapiDecoratorNotServiceCall(): Promise<void> {
+  console.log('\n── Bug 9: FastAPI route decorators are not outbound service calls ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug9-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'api.py'), [
+    'from fastapi import FastAPI',
+    'import requests',
+    'app = FastAPI()',
+    '',
+    '@app.post("/api/payments/charge")',
+    'def charge_handler(amount: int):',
+    '    requests.post("http://notify/notify", json={})',
+    '    return {"ok": True}',
+    '',
+    '@app.get("/api/payments/{payment_id}")',
+    'def get_payment(payment_id: str):',
+    '    return {"id": payment_id}',
+    '',
+  ].join('\n'));
+  const store = new Store(path.join(tmp, 'g.db'));
+  const indexer = new Indexer(store);
+  await indexer.indexDirectory(tmp, { quiet: true });
+
+  const calls = store.listServiceCalls({ limit: 100 });
+  const targets = calls.map(c => `${c.framework}:${c.normalizedPath ?? c.rawTarget}`);
+  // The only legitimate outbound call is requests.post -> /notify.
+  assert(calls.length === 1 && calls[0].framework === 'requests',
+    `exactly one outbound call (requests.post), got ${JSON.stringify(targets)}`);
+  assert(!calls.some(c => c.framework === 'http-client'),
+    `no phantom http-client service_call from @app.post/@app.get decorators`);
+  // Routes must still be detected.
+  const routes = store.listRoutes({ framework: 'fastapi', limit: 50 });
+  assert(routes.some(r => r.method === 'POST' && r.path === '/api/payments/charge'),
+    `FastAPI POST route still extracted`);
+  // No self-link: a route should never link to its own registration site.
+  resolveServiceLinks(store);
+  const links = store.listServiceLinks({ limit: 100 });
+  assert(!links.some(l => /payments\/charge/.test(l.routePath ?? '') && /payments\/charge/.test(l.callRawTarget ?? '')),
+    `no self-link of /api/payments/charge route to a phantom client call`);
+
+  store.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── Bug 10: TS template-literal path param dropped, breaking segment match ──
+// `axios.get(`http://svc/api/users/${id}`)` collapsed to `/api/users` (the
+// `${id}` segment vanished), so it could not match a `/api/users/:id` route.
+// Non-env substitutions now emit a `:param` placeholder segment.
+async function bug10_tsTemplatePathParam(): Promise<void> {
+  console.log('\n── Bug 10: TS template path param preserved as a segment ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug10-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'client.ts'), [
+    'import axios from "axios";',
+    'export async function getUser(id: string) {',
+    '  return axios.get(`http://svc/api/users/${id}`);',
+    '}',
+    'export async function charge() {',
+    '  return fetch(`${process.env.PAY_URL}/charge`, { method: "POST" });',
+    '}',
+  ].join('\n'));
+  const store = new Store(path.join(tmp, 'g.db'));
+  const indexer = new Indexer(store);
+  await indexer.indexDirectory(tmp, { quiet: true });
+
+  const calls = store.listServiceCalls({ limit: 100 });
+  const user = calls.find(c => /users/.test(c.normalizedPath ?? c.rawTarget));
+  assert(!!user && user.normalizedPath === '/api/users/:param',
+    `template param preserved: /api/users/:param (got ${user?.normalizedPath})`);
+  // env-base substitution still recovers the env key and the literal tail only.
+  const pay = calls.find(c => /charge/.test(c.normalizedPath ?? c.rawTarget));
+  assert(!!pay && pay.normalizedPath === '/charge' && pay.envKey === 'PAY_URL',
+    `env-base substitution still yields /charge + envKey=PAY_URL (got ${pay?.normalizedPath}, ${pay?.envKey})`);
+
+  store.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── Bug 11: C++ out-of-line method definitions reconstruct class scope ──────
+// `T Vec<T>::dot(...)` defined at namespace scope used to qualify as `geo.dot`
+// (reads like a free function). It now folds the owner scope from the
+// qualified_identifier declarator into the qualified name -> `geo.Vec.dot`,
+// and keeps `Foo::bar` / `Baz::bar` distinct instead of collapsing to bar/bar#1.
+async function bug11_cppOutOfLineScope(): Promise<void> {
+  console.log('\n── Bug 11: C++ out-of-line method qualified-name class scope ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug11-${Date.now()}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'shapes.cpp'), [
+    'namespace geo {',
+    'template <typename T> class Vec {',
+    'public:',
+    '  T dot(const Vec& o) const;',          // in-class declaration
+    '};',
+    'template <typename T> T Vec<T>::dot(const Vec& o) const { return o.x; }', // out-of-line def
+    'struct Mat { double det() const; };',
+    'double Mat::det() const { return 0.0; }',  // distinct owner, same idea
+    '}',
+    '',
+  ].join('\n'));
+  const store = new Store(path.join(tmp, 'g.db'));
+  const indexer = new Indexer(store);
+  await indexer.indexDirectory(tmp, { quiet: true });
+
+  const dot = store.getDefinition('dot', { includeDeclarations: true });
+  assert(dot.length >= 1 && dot.every(d => d.qualifiedName === 'geo.Vec.dot'),
+    `out-of-line Vec::dot qualified geo.Vec.dot (got ${JSON.stringify(dot.map(d => d.qualifiedName))})`);
+  const det = store.getDefinition('det', { includeDeclarations: true });
+  assert(det.some(d => d.qualifiedName === 'geo.Mat.det'),
+    `out-of-line Mat::det qualified geo.Mat.det (got ${JSON.stringify(det.map(d => d.qualifiedName))})`);
+  // The two distinct owners must NOT collapse into bar / bar#1 style siblings.
+  assert(!dot.some(d => /#/.test(d.qualifiedName ?? '')) && !det.some(d => /#/.test(d.qualifiedName ?? '')),
+    `distinct owners do not collapse into #N overload siblings`);
+
+  store.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── Bug 12: getDefinition file filter accepts a path-suffix on a boundary ───
+// The `file` disambiguator was exact-match only; a basename like `svc.ts`
+// could not match rel_path `src/svc.ts`, silently returning nothing. It now
+// matches a trailing fragment on a `/` boundary, with LIKE metachars escaped.
+async function bug12_fileFilterSuffixMatch(): Promise<void> {
+  console.log('\n── Bug 12: getDefinition file filter accepts path-suffix ──');
+  const tmp = path.join(os.tmpdir(), `seer-bug12-${Date.now()}`);
+  fs.mkdirSync(path.join(tmp, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'src/svc.ts'), 'export function handler() { return 1; }\n');
+  fs.writeFileSync(path.join(tmp, 'src/o_auth.ts'), 'export function tokenize() { return 2; }\n');
+  const store = new Store(path.join(tmp, 'g.db'));
+  const indexer = new Indexer(store);
+  await indexer.indexDirectory(tmp, { quiet: true });
+
+  assert(store.getDefinition('handler', { filePath: 'svc.ts' }).length === 1,
+    `basename 'svc.ts' resolves to src/svc.ts`);
+  assert(store.getDefinition('handler', { filePath: 'src/svc.ts' }).length === 1,
+    `exact rel_path still resolves`);
+  assert(store.getDefinition('handler', { filePath: 'vc.ts' }).length === 0,
+    `non-boundary partial 'vc.ts' does NOT match (segment boundary enforced)`);
+  // `_` must not behave as a LIKE wildcard: 'oXauth.ts' must not match o_auth.ts.
+  assert(store.getDefinition('tokenize', { filePath: 'o_auth.ts' }).length === 1,
+    `underscore filename matches literally (o_auth.ts)`);
+  assert(store.getDefinition('tokenize', { filePath: 'oXauth.ts' }).length === 0,
+    `underscore is escaped, not a single-char wildcard`);
+
+  store.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
 async function run(): Promise<void> {
   console.log('\nSeer Bug-Regression Tests');
   console.log('===========================');
@@ -449,6 +612,10 @@ async function run(): Promise<void> {
   await bug6_fastifyObjectRoutes();
   bug7_testEdgeDuplicateIndex();
   bug8_sameFileResolutionIndex();
+  await bug9_fastapiDecoratorNotServiceCall();
+  await bug10_tsTemplatePathParam();
+  await bug11_cppOutOfLineScope();
+  await bug12_fileFilterSuffixMatch();
 
   console.log(`\n══════════════════════════════════════════════════════════════`);
   console.log(`  Regression results: ${passed} passed, ${failed} failed`);

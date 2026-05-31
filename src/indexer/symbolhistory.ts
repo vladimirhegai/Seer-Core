@@ -3,6 +3,7 @@ import {
   commitsForFile, fileDiffInfo, isGitRepo, gitHeadSha, gitRemoteUrl,
   extractPrNumber, githubPrUrl,
 } from './git.js';
+import { buildContinuity } from './continuity.js';
 
 /**
  * Symbol-history pass — for every indexed function/method/constructor/class
@@ -143,6 +144,18 @@ export async function buildSymbolHistory(
         totalInserts++;
       }
     }
+  }
+
+  // v10 — run the continuity heuristics for symbols whose recorded history is
+  // shallow. Strictly additive (lives in symbol_history_continuity); never
+  // touches symbol_history rows.
+  try {
+    if (store.hasV10()) {
+      const cont = buildContinuity(store, { historyThreshold: 1 });
+      log(`continuity: considered=${cont.candidatesConsidered}, inserted=${cont.inserted}, skipped=${cont.skipped}`);
+    }
+  } catch (err) {
+    log(`continuity pass failed: ${(err as Error).message}`);
   }
 
   // Stamp the history-specific HEAD marker (not the generic one) so a future

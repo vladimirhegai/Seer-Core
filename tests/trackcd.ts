@@ -59,7 +59,7 @@ async function run(): Promise<void> {
   console.log('── Schema ──');
   const schema = store.schemaInfo();
   assertEq(schema.current, true, 'schema is current');
-  assertEq(schema.dbVersion, 5, `schema version is v5`);
+  assertEq(schema.dbVersion, 10, `schema version is v10`);
 
   // ── Helper: tokenizer ─────────────────────────────────────────────────────
   console.log('\n── Identifier tokenizer ──');

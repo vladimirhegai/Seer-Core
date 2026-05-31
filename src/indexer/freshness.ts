@@ -128,7 +128,11 @@ export async function jitSync(
     // and reconcile edge graphs. The indexer's cache means unchanged files
     // are still skipped at parse time, so this is O(dirty + added + |touched|)
     // not O(|workspace|).
-    const result = await indexer.indexDirectory(absRoot, { quiet: !options.verbose });
+    // JIT pins parallel:false. The dirty set is small (≤ maxDirty=200) and
+    // worker spawn cost dominates the wins at this scale; serial is the
+    // right default for the snappy "edit + ask" loop. MCP servers that want
+    // parallel JIT can override later via an option.
+    const result = await indexer.indexDirectory(absRoot, { quiet: !options.verbose, parallel: false });
     return {
       dirtyReindexed: dirty.length,
       removed: removed.length,
@@ -141,7 +145,7 @@ export async function jitSync(
   // the indexer's machinery by calling indexDirectory — its cache skips
   // unchanged files. This is dominated by the discovery walk we already did,
   // so the marginal cost is small.
-  await indexer.indexDirectory(absRoot, { quiet: !options.verbose });
+  await indexer.indexDirectory(absRoot, { quiet: !options.verbose, parallel: false });
   return {
     dirtyReindexed: dirty.length,
     removed: removed.length,

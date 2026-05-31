@@ -23,6 +23,8 @@ const RANKABLE_KINDS: ReadonlySet<SymbolKind> = new Set<SymbolKind>([
   'function', 'method', 'constructor', 'class',
 ]);
 
+const SERVICE_CALLS_BACKFILL_VERSION = '1';
+
 export function isRankableKind(kind: string): boolean {
   return RANKABLE_KINDS.has(kind as SymbolKind);
 }
@@ -31,9 +33,31 @@ export function isRankableKind(kind: string): boolean {
 type Row = Record<string, unknown>;
 
 function toNum(v: unknown): number { return Number(v); }
+/** Escape SQLite LIKE metacharacters (`%`, `_`, `\`) for use with ESCAPE '\'.
+ *  Lets a literal filename like `bom_crlf.ts` match without `_` acting as a
+ *  single-char wildcard. */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, m => '\\' + m);
+}
 function toStr(v: unknown): string { return String(v ?? ''); }
 function toNullStr(v: unknown): string | null { return v == null ? null : String(v); }
 function toNullNum(v: unknown): number | null { return v == null ? null : Number(v); }
+
+/**
+ * Convert a 64-bit unsigned bigint shape hash into a signed bigint suitable
+ * for storage in an SQLite INTEGER column. We treat the high bit as the sign,
+ * so `0x8000_0000_0000_0000` and above wrap into negative values; this round-
+ * trips losslessly with `toUnsignedI64` below.
+ */
+function toSignedI64(u: bigint): bigint {
+  const MAX_I64 = 0x7FFFFFFFFFFFFFFFn;
+  return u > MAX_I64 ? u - 0x10000000000000000n : u;
+}
+function toUnsignedI64(v: unknown): bigint {
+  if (v == null) return 0n;
+  const b = typeof v === 'bigint' ? v : BigInt(Number(v));
+  return b < 0n ? b + 0x10000000000000000n : b;
+}
 
 export interface EdgeResolutionStats {
   sameFile: number;
@@ -197,6 +221,23 @@ export class Store {
    * writer opens always have it since runMigrations() adds the column.
    */
   private hasSymbolRoleColumn: boolean;
+  /**
+   * True when the v6 module tables (modules / module_members / module_edges)
+   * exist. Read-only opens against a pre-v6 DB skip module queries gracefully
+   * (they return empty arrays); writer opens always have it.
+   */
+  private hasModuleTables: boolean;
+  /**
+   * True when the v7 provenance/shape_hash columns + scip_imports table exist.
+   * Read-only opens against a pre-v7 DB return empty arrays for SCIP / dup
+   * queries and skip the provenance column on selects.
+   */
+  private hasV7Columns: boolean;
+  /**
+   * True when v10 external_bundles / boundaries / symbol_history_continuity
+   * tables exist. Read-only opens against a pre-v10 DB return empty arrays.
+   */
+  private hasV10Tables: boolean;
 
   // Prepared statements — initialized in constructor (writer path only)
   private stmtUpsertFile!: StatementSync;
@@ -206,6 +247,8 @@ export class Store {
   private stmtInsertRoute!: StatementSync;
   private stmtInsertConfigKey!: StatementSync;
   private stmtInsertExternalDep!: StatementSync;
+  private stmtInsertServiceCall!: StatementSync;
+  private stmtInsertServiceLink!: StatementSync;
   private stmtInsertSymbolsFts!: StatementSync;
   private stmtInsertFilesFts!: StatementSync;
   private stmtDeleteSymbolsFtsForFile!: StatementSync;
@@ -232,6 +275,31 @@ export class Store {
     this.hasComplexityColumns = this.hasColumn('symbols', 'cyclomatic');
     this.hasV4Tables = this.checkHasV4Tables();
     this.hasSymbolRoleColumn = this.hasColumn('symbols', 'symbol_role');
+    this.hasModuleTables = this.checkHasModuleTables();
+    this.hasV7Columns = this.hasColumn('symbols', 'provenance') && this.hasColumn('symbols', 'shape_hash');
+    this.hasV10Tables = this.checkHasV10Tables();
+  }
+
+  private checkHasV10Tables(): boolean {
+    try {
+      const rows = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('external_bundles','boundaries','boundary_members','boundary_edges','symbol_history_continuity')"
+      ).all() as Row[];
+      return rows.length === 5;
+    } catch {
+      return false;
+    }
+  }
+
+  private checkHasModuleTables(): boolean {
+    try {
+      const rows = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('modules','module_members','module_edges')"
+      ).all() as Row[];
+      return rows.length === 3;
+    } catch {
+      return false;
+    }
   }
 
   private checkHasRoleColumns(): boolean {
@@ -261,7 +329,41 @@ export class Store {
 
   isReadOnly(): boolean { return this.readonly; }
 
+  private assertWritable(): void {
+    if (this.readonly) {
+      throw new Error('Store is read-only; open a writable Store to mutate the index');
+    }
+  }
+
   schemaInfo(): SchemaInfo { return this.cachedSchemaInfo; }
+
+  /**
+   * v8 Track-G migration guard. When an existing v7 DB is opened by v8 code,
+   * service_calls/service_links tables are created empty. A normal cached
+   * re-index would skip every unchanged file, so service_calls would remain
+   * empty forever. Until an index run marks this backfill version complete,
+   * the indexer must force one full parse pass.
+   */
+  needsServiceCallBackfill(): boolean {
+    try {
+      const row = this.db.prepare(
+        "SELECT value FROM _schema_meta WHERE key = 'service_calls_backfilled'",
+      ).get() as Row | undefined;
+      if (row && toStr(row.value) === SERVICE_CALLS_BACKFILL_VERSION) return false;
+      const files = this.db.prepare('SELECT COUNT(*) AS c FROM files').get() as Row;
+      return toNum(files.c) > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  markServiceCallsBackfilled(): void {
+    this.assertWritable();
+    this.db.prepare(
+      "INSERT INTO _schema_meta (key, value) VALUES ('service_calls_backfilled', ?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(SERVICE_CALLS_BACKFILL_VERSION);
+  }
 
   private readSchemaInfo(): SchemaInfo {
     let dbVersion = 0;
@@ -328,6 +430,223 @@ export class Store {
     // is now emitted as 'declaration').
     this.addColumnIfMissing('symbols', 'symbol_role', "TEXT NOT NULL DEFAULT 'definition'");
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_symbol_role ON symbols(symbol_role)');
+
+    // v7: provenance + shape_hash on symbols/edges, plus scip_imports table.
+    // ALTER ADD COLUMN paths are cheap and idempotent; the index creation is
+    // guarded by hasColumn so a partial migration on an older DB doesn't fail.
+    this.addColumnIfMissing('symbols', 'provenance', "TEXT NOT NULL DEFAULT 'tree-sitter'");
+    this.addColumnIfMissing('symbols', 'shape_hash', 'INTEGER');
+    this.addColumnIfMissing('edges',   'provenance', "TEXT NOT NULL DEFAULT 'tree-sitter'");
+    // v7.1 — scip_import_id links a SCIP-provenance row back to the
+    // scip_imports table entry that produced it, so re-importing or clearing
+    // ONE SCIP layer doesn't nuke rows contributed by sibling layers (the
+    // original v7 wipe was global, which collapsed multi-layer setups).
+    this.addColumnIfMissing('symbols', 'scip_import_id', 'INTEGER');
+    this.addColumnIfMissing('edges',   'scip_import_id', 'INTEGER');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_provenance ON symbols(provenance)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_shape_hash ON symbols(shape_hash) WHERE shape_hash IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_provenance  ON edges(provenance)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_scip_import ON symbols(scip_import_id)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_scip_import  ON edges(scip_import_id)');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scip_imports (
+        id            INTEGER PRIMARY KEY,
+        path          TEXT    NOT NULL,
+        sha256        TEXT    NOT NULL,
+        tool          TEXT,
+        project_root  TEXT,
+        imported_at   INTEGER NOT NULL,
+        symbol_count  INTEGER NOT NULL DEFAULT 0,
+        ref_count     INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(path, sha256)
+      );
+      CREATE INDEX IF NOT EXISTS idx_scip_imports_path ON scip_imports(path);
+    `);
+
+    // v6: modules + module_members + module_edges. CREATE TABLE IF NOT EXISTS
+    // is the migration — pre-v6 DBs get the tables on first writer open.
+    // No backfill needed: the clustering pass repopulates them on the next
+    // index run (it always runs when the graph changed; otherwise the cached
+    // membership stays valid because the graph it was built from stays valid).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS modules (
+        id              INTEGER PRIMARY KEY,
+        label           TEXT    NOT NULL,
+        size_files      INTEGER NOT NULL DEFAULT 0,
+        size_symbols    INTEGER NOT NULL DEFAULT 0,
+        primary_language TEXT,
+        cohesion        REAL    NOT NULL DEFAULT 0,
+        centrality      REAL    NOT NULL DEFAULT 0,
+        computed_at     INTEGER NOT NULL DEFAULT 0,
+        algorithm       TEXT    NOT NULL DEFAULT 'louvain'
+      );
+      CREATE INDEX IF NOT EXISTS idx_modules_label      ON modules(label);
+      CREATE INDEX IF NOT EXISTS idx_modules_centrality ON modules(centrality DESC);
+      CREATE INDEX IF NOT EXISTS idx_modules_size       ON modules(size_files DESC);
+      CREATE TABLE IF NOT EXISTS module_members (
+        file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        module_id  INTEGER NOT NULL REFERENCES modules(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_module_members_module ON module_members(module_id);
+      CREATE TABLE IF NOT EXISTS module_edges (
+        id              INTEGER PRIMARY KEY,
+        from_module_id  INTEGER NOT NULL REFERENCES modules(id) ON DELETE CASCADE,
+        to_module_id    INTEGER NOT NULL REFERENCES modules(id) ON DELETE CASCADE,
+        kind            TEXT    NOT NULL DEFAULT 'call',
+        weight          INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(from_module_id, to_module_id, kind)
+      );
+      CREATE INDEX IF NOT EXISTS idx_module_edges_from   ON module_edges(from_module_id);
+      CREATE INDEX IF NOT EXISTS idx_module_edges_to     ON module_edges(to_module_id);
+    `);
+
+    // v8: Track-G service_calls + service_links. CREATE TABLE IF NOT EXISTS
+    // is the migration. Existing cached DBs need one forced parse pass to
+    // populate service_calls; needsServiceCallBackfill() + the indexer marker
+    // handle that so unchanged hashes do not leave the tables empty forever.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS service_calls (
+        id              INTEGER PRIMARY KEY,
+        file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        symbol_id       INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+        protocol        TEXT    NOT NULL,
+        method          TEXT,
+        raw_target      TEXT    NOT NULL,
+        normalized_path TEXT,
+        host_hint       TEXT,
+        env_key         TEXT,
+        framework       TEXT    NOT NULL,
+        line            INTEGER NOT NULL DEFAULT 0,
+        confidence      REAL    NOT NULL DEFAULT 0.5
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_calls_symbol_id ON service_calls(symbol_id);
+      CREATE INDEX IF NOT EXISTS idx_service_calls_path      ON service_calls(normalized_path);
+      CREATE INDEX IF NOT EXISTS idx_service_calls_protocol  ON service_calls(protocol);
+      CREATE INDEX IF NOT EXISTS idx_service_calls_file_id   ON service_calls(file_id);
+
+      CREATE TABLE IF NOT EXISTS service_links (
+        id                INTEGER PRIMARY KEY,
+        call_id           INTEGER NOT NULL REFERENCES service_calls(id) ON DELETE CASCADE,
+        route_id          INTEGER REFERENCES routes(id) ON DELETE CASCADE,
+        caller_symbol_id  INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+        handler_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+        protocol          TEXT    NOT NULL,
+        match_kind        TEXT    NOT NULL,
+        confidence        REAL    NOT NULL,
+        evidence_json     TEXT    NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_links_call_id    ON service_links(call_id);
+      CREATE INDEX IF NOT EXISTS idx_service_links_handler    ON service_links(handler_symbol_id);
+      CREATE INDEX IF NOT EXISTS idx_service_links_caller     ON service_links(caller_symbol_id);
+      CREATE INDEX IF NOT EXISTS idx_service_links_protocol   ON service_links(protocol);
+      CREATE INDEX IF NOT EXISTS idx_service_links_match_kind ON service_links(match_kind);
+    `);
+
+    // v9: Track-H protocol expansion. Adds generalized columns to service_calls
+    // and routes so non-HTTP protocols (tRPC / GraphQL / gRPC / Kafka / etc.)
+    // can be stored alongside HTTP without one column per protocol. All
+    // additions are nullable (or default 'http' for routes.protocol) so v8 DBs
+    // upgrade in-place with no data rewrite. Existing HTTP rows keep working
+    // unchanged because the resolver still matches on normalized_path + method
+    // when the new fields are NULL.
+    this.addColumnIfMissing('service_calls', 'operation',     'TEXT');
+    this.addColumnIfMissing('service_calls', 'topic',         'TEXT');
+    this.addColumnIfMissing('service_calls', 'queue',         'TEXT');
+    this.addColumnIfMissing('service_calls', 'exchange',      'TEXT');
+    this.addColumnIfMissing('service_calls', 'service',       'TEXT');
+    this.addColumnIfMissing('service_calls', 'broker',        'TEXT');
+    this.addColumnIfMissing('service_calls', 'metadata_json', 'TEXT');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_operation ON service_calls(operation) WHERE operation IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_topic     ON service_calls(topic)     WHERE topic IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_queue     ON service_calls(queue)     WHERE queue IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_service   ON service_calls(service)   WHERE service IS NOT NULL');
+
+    this.addColumnIfMissing('routes', 'protocol',      "TEXT NOT NULL DEFAULT 'http'");
+    this.addColumnIfMissing('routes', 'operation',     'TEXT');
+    this.addColumnIfMissing('routes', 'topic',         'TEXT');
+    this.addColumnIfMissing('routes', 'queue',         'TEXT');
+    this.addColumnIfMissing('routes', 'exchange',      'TEXT');
+    this.addColumnIfMissing('routes', 'service',       'TEXT');
+    this.addColumnIfMissing('routes', 'broker',        'TEXT');
+    this.addColumnIfMissing('routes', 'metadata_json', 'TEXT');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_protocol  ON routes(protocol)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_operation ON routes(operation) WHERE operation IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_topic     ON routes(topic)     WHERE topic IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_queue     ON routes(queue)     WHERE queue IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_service   ON routes(service)   WHERE service IS NOT NULL');
+
+    // v10 — external bundle layers + monorepo boundaries + history continuity.
+    // CREATE IF NOT EXISTS + ALTER ADD COLUMN keep older DBs upgradable
+    // without data rewrites. The default values are chosen so HTTP/local
+    // behavior is unchanged on rows that don't set the new fields.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS external_bundles (
+        id              INTEGER PRIMARY KEY,
+        source_kind     TEXT    NOT NULL DEFAULT 'external-bundle',
+        bundle_path     TEXT    NOT NULL,
+        external_project TEXT,
+        external_version TEXT,
+        external_hash    TEXT,
+        schema_version  INTEGER NOT NULL DEFAULT 0,
+        imported_at     INTEGER NOT NULL,
+        routes_imported INTEGER NOT NULL DEFAULT 0,
+        service_calls_imported INTEGER NOT NULL DEFAULT 0,
+        service_links_imported INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(bundle_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_external_bundles_project ON external_bundles(external_project);
+      CREATE TABLE IF NOT EXISTS boundaries (
+        id              INTEGER PRIMARY KEY,
+        label           TEXT    NOT NULL,
+        kind            TEXT    NOT NULL DEFAULT 'package',
+        root_rel_path   TEXT    NOT NULL,
+        manifest_path   TEXT,
+        ecosystem       TEXT,
+        size_files      INTEGER NOT NULL DEFAULT 0,
+        computed_at     INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(root_rel_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_boundaries_label ON boundaries(label);
+      CREATE INDEX IF NOT EXISTS idx_boundaries_kind  ON boundaries(kind);
+      CREATE TABLE IF NOT EXISTS boundary_members (
+        file_id     INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        boundary_id INTEGER NOT NULL REFERENCES boundaries(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_boundary_members_boundary ON boundary_members(boundary_id);
+      CREATE TABLE IF NOT EXISTS boundary_edges (
+        id                INTEGER PRIMARY KEY,
+        from_boundary_id  INTEGER NOT NULL REFERENCES boundaries(id) ON DELETE CASCADE,
+        to_boundary_id    INTEGER NOT NULL REFERENCES boundaries(id) ON DELETE CASCADE,
+        kind              TEXT    NOT NULL DEFAULT 'call',
+        weight            INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(from_boundary_id, to_boundary_id, kind)
+      );
+      CREATE INDEX IF NOT EXISTS idx_boundary_edges_from ON boundary_edges(from_boundary_id);
+      CREATE INDEX IF NOT EXISTS idx_boundary_edges_to   ON boundary_edges(to_boundary_id);
+      CREATE TABLE IF NOT EXISTS symbol_history_continuity (
+        id                  INTEGER PRIMARY KEY,
+        symbol_id           INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+        symbol_key          TEXT    NOT NULL,
+        previous_symbol_key TEXT,
+        previous_name       TEXT,
+        previous_file       TEXT,
+        bridging_sha        TEXT,
+        confidence          REAL    NOT NULL DEFAULT 0.0,
+        match_reasons       TEXT    NOT NULL DEFAULT '[]',
+        recorded_at         INTEGER NOT NULL,
+        UNIQUE(symbol_id, previous_symbol_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_symbol_history_continuity_symbol ON symbol_history_continuity(symbol_id);
+      CREATE INDEX IF NOT EXISTS idx_symbol_history_continuity_prev   ON symbol_history_continuity(previous_symbol_key);
+    `);
+    // v10 — external_bundle_id columns on rows that can come from an external
+    // layer. NULL = local row (default).
+    this.addColumnIfMissing('routes',         'external_bundle_id', 'INTEGER');
+    this.addColumnIfMissing('service_calls',  'external_bundle_id', 'INTEGER');
+    this.addColumnIfMissing('service_links',  'external_bundle_id', 'INTEGER');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_routes_external_bundle ON routes(external_bundle_id) WHERE external_bundle_id IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_external_bundle ON service_calls(external_bundle_id) WHERE external_bundle_id IS NOT NULL');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_links_external_bundle ON service_links(external_bundle_id) WHERE external_bundle_id IS NOT NULL');
 
     // v4 backfill — required because upsertFileWithCache() short-circuits on
     // unchanged content hash, so a v3 DB upgraded to v4 would never get
@@ -462,8 +781,10 @@ export class Store {
     `);
 
     this.stmtInsertRoute = this.db.prepare(`
-      INSERT INTO routes (file_id, method, path, framework, handler_name, line)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO routes
+        (file_id, method, path, framework, handler_name, line,
+         protocol, operation, topic, queue, exchange, service, broker, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.stmtInsertConfigKey = this.db.prepare(`
@@ -475,6 +796,21 @@ export class Store {
       INSERT OR REPLACE INTO external_dependencies
         (ecosystem, name, version_range, manifest_path, is_dev)
       VALUES (?, ?, ?, ?, ?)
+    `);
+
+    this.stmtInsertServiceCall = this.db.prepare(`
+      INSERT INTO service_calls
+        (file_id, symbol_id, protocol, method, raw_target, normalized_path,
+         host_hint, env_key, framework, line, confidence,
+         operation, topic, queue, exchange, service, broker, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.stmtInsertServiceLink = this.db.prepare(`
+      INSERT INTO service_links
+        (call_id, route_id, caller_symbol_id, handler_symbol_id,
+         protocol, match_kind, confidence, evidence_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.stmtInsertSymbolsFts = this.db.prepare(
@@ -494,7 +830,13 @@ export class Store {
   // ── Write operations ────────────────────────────────────────────────────────
 
   pruneFilesNotIn(keepIds: Set<number>): number {
-    if (keepIds.size === 0) {
+    this.assertWritable();
+    // v10 — external bundle phantom files use path 'external' as language so
+    // they're never pruned by accident on a cached re-index. The pruner adds
+    // them to keepIds before the delete pass so importing an external bundle,
+    // then running a regular `seer index`, leaves the external layer intact.
+    const externalIds = this.listExternalPhantomFileIds();
+    if (keepIds.size === 0 && externalIds.length === 0) {
       const res = this.db.prepare('DELETE FROM files').run();
       // FTS is contentless — wipe in parallel.
       try { this.db.exec('DELETE FROM symbols_fts'); this.db.exec('DELETE FROM files_fts'); } catch { /* */ }
@@ -506,6 +848,9 @@ export class Store {
       this.db.exec('DELETE FROM _keep');
       const insert = this.db.prepare('INSERT INTO _keep (id) VALUES (?)');
       for (const id of keepIds) insert.run(id);
+      for (const id of externalIds) {
+        try { insert.run(id); } catch { /* duplicate keep id; ignore */ }
+      }
       // Wipe FTS rows for files we're about to delete (pre-delete, before
       // their ids become unrecoverable).
       try {
@@ -541,6 +886,7 @@ export class Store {
     lines: number,
     classification: FileClassification = { role: 'project', isVendor: 0, isGenerated: 0 },
   ): number {
+    this.assertWritable();
     const existing = this.db.prepare('SELECT id FROM files WHERE path = ?').get(path) as Row | undefined;
     if (existing) {
       const fileId = toNum(existing.id);
@@ -550,6 +896,7 @@ export class Store {
       this.db.prepare('DELETE FROM file_imports WHERE from_file_id = ?').run(fileId);
       this.db.prepare('DELETE FROM routes WHERE file_id = ?').run(fileId);
       this.db.prepare('DELETE FROM config_keys WHERE file_id = ?').run(fileId);
+      this.db.prepare('DELETE FROM service_calls WHERE file_id = ?').run(fileId);
       try { this.stmtDeleteFilesFtsForFile.run(fileId); } catch { /* */ }
     }
 
@@ -566,6 +913,7 @@ export class Store {
     path: string, relPath: string, language: string, hash: string, lines: number,
     classification: FileClassification = { role: 'project', isVendor: 0, isGenerated: 0 },
   ): { fileId: number; unchanged: boolean } {
+    this.assertWritable();
     const existing = this.db
       .prepare('SELECT id, hash, role, is_vendor, is_generated FROM files WHERE path = ?')
       .get(path) as Row | undefined;
@@ -601,6 +949,7 @@ export class Store {
       this.db.prepare('DELETE FROM file_imports WHERE from_file_id = ?').run(fileId);
       this.db.prepare('DELETE FROM routes WHERE file_id = ?').run(fileId);
       this.db.prepare('DELETE FROM config_keys WHERE file_id = ?').run(fileId);
+      this.db.prepare('DELETE FROM service_calls WHERE file_id = ?').run(fileId);
       try { this.stmtDeleteFilesFtsForFile.run(fileId); } catch { /* */ }
     }
 
@@ -614,6 +963,7 @@ export class Store {
   }
 
   insertSymbol(fileId: number, def: SymbolDef): number {
+    this.assertWritable();
     const sig = def.signature ? def.signature.slice(0, 240) : null;
     const qualified = def.qualifiedName ?? def.name;
     const symbolRole: SymbolRole = def.symbolRole ?? 'definition';
@@ -651,35 +1001,138 @@ export class Store {
   }
 
   insertEdge(fromSymbolId: number, toName: string, kind: string, line: number): void {
+    this.assertWritable();
     this.stmtInsertEdge.run(fromSymbolId, toName, kind, line);
   }
 
   insertFileImport(fromFileId: number, importName: string): void {
+    this.assertWritable();
     this.stmtInsertFileImport.run(fromFileId, importName);
   }
 
   insertRoute(
     fileId: number, method: string, routePath: string, framework: string,
     handlerName: string | null, line: number,
+    options: {
+      protocol?: string;
+      operation?: string | null;
+      topic?: string | null;
+      queue?: string | null;
+      exchange?: string | null;
+      service?: string | null;
+      broker?: string | null;
+      metadataJson?: string | null;
+    } = {},
   ): void {
-    this.stmtInsertRoute.run(fileId, method, routePath, framework, handlerName, line);
+    this.assertWritable();
+    this.stmtInsertRoute.run(
+      fileId, method, routePath, framework, handlerName, line,
+      options.protocol ?? 'http',
+      options.operation ?? null,
+      options.topic ?? null,
+      options.queue ?? null,
+      options.exchange ?? null,
+      options.service ?? null,
+      options.broker ?? null,
+      options.metadataJson ?? null,
+    );
   }
 
   insertConfigKey(
     key: string, source: string, fileId: number,
     symbolId: number | null, line: number,
   ): void {
+    this.assertWritable();
     this.stmtInsertConfigKey.run(key, source, fileId, symbolId, line);
+  }
+
+  /**
+   * v8 Track G — return a closure that inserts service_link rows. Used by
+   * the resolver in `resolveServiceLinks(store)` so it can stream inserts
+   * inside one prepared statement rather than re-resolving the statement
+   * per row.
+   */
+  makeServiceLinkInserter(): (args: {
+    callId: number;
+    routeId: number | null;
+    callerSymbolId: number | null;
+    handlerSymbolId: number | null;
+    protocol: string;
+    matchKind: string;
+    confidence: number;
+    evidenceJson: string;
+  }) => void {
+    this.assertWritable();
+    const stmt = this.stmtInsertServiceLink;
+    return (a) => {
+      stmt.run(
+        a.callId, a.routeId, a.callerSymbolId, a.handlerSymbolId,
+        a.protocol, a.matchKind, a.confidence, a.evidenceJson,
+      );
+    };
+  }
+
+  /**
+   * v8 Track G — insert a service-call row (outbound HTTP/etc. client call).
+   * The post-index resolver derives service_links from these and from routes.
+   * Returns the new row id so callers can attach evidence in the same batch.
+   */
+  insertServiceCall(args: {
+    fileId: number;
+    symbolId: number | null;
+    protocol: string;
+    method: string | null;
+    rawTarget: string;
+    normalizedPath: string | null;
+    hostHint: string | null;
+    envKey: string | null;
+    framework: string;
+    line: number;
+    confidence: number;
+    // v9 Track-H protocol expansion. All optional; protocol-specific extractors
+    // fill the fields that apply to their protocol and leave the rest NULL.
+    operation?: string | null;
+    topic?: string | null;
+    queue?: string | null;
+    exchange?: string | null;
+    service?: string | null;
+    broker?: string | null;
+    metadataJson?: string | null;
+  }): number {
+    this.assertWritable();
+    const r = this.stmtInsertServiceCall.run(
+      args.fileId,
+      args.symbolId,
+      args.protocol,
+      args.method,
+      args.rawTarget.slice(0, 240),
+      args.normalizedPath,
+      args.hostHint,
+      args.envKey,
+      args.framework,
+      args.line,
+      args.confidence,
+      args.operation ?? null,
+      args.topic ?? null,
+      args.queue ?? null,
+      args.exchange ?? null,
+      args.service ?? null,
+      args.broker ?? null,
+      args.metadataJson ?? null,
+    );
+    return toNum(r.lastInsertRowid);
   }
 
   insertExternalDep(
     ecosystem: string, name: string, versionRange: string | null,
     manifestPath: string, isDev: 0 | 1,
   ): void {
+    this.assertWritable();
     this.stmtInsertExternalDep.run(ecosystem, name, versionRange, manifestPath, isDev);
   }
 
   clearExternalDeps(): void {
+    this.assertWritable();
     this.db.exec('DELETE FROM external_dependencies');
   }
 
@@ -856,6 +1309,16 @@ export class Store {
    * test edges live in their own kind so `seer_behavior` can pull them
    * directly without scanning the full edge table.
    *
+   * The synthesized edge copies the SOURCE 'call' edge's `to_id` verbatim —
+   * the call-edge resolution pass already did the same-file / imported /
+   * global fallback work to pick the correct target. Re-resolving by name
+   * via `WHERE name = edges.to_name LIMIT 1` (the old behavior) was buggy
+   * when two symbols shared the same short name (`Alpha.run` / `Beta.run`):
+   * `LIMIT 1` would attribute every test edge to whichever id sorted first,
+   * so `seer_behavior(Beta.run)` returned tests that actually exercised
+   * `Alpha.run`. Preserving the source `to_id` matches what the original
+   * resolver already chose.
+   *
    * Returns the number of new test edges inserted.
    */
   synthesizeTestEdges(): number {
@@ -880,24 +1343,21 @@ export class Store {
     `).all() as Row[];
 
     if (rows.length === 0) return 0;
+    // Insert with to_id set explicitly from the source edge — no LIMIT 1
+    // name re-resolution that would collapse same-short-name symbols.
+    const insert = this.db.prepare(
+      "INSERT INTO edges (from_id, to_name, to_id, kind, line) VALUES (?, ?, ?, 'tests', ?)",
+    );
     this.db.exec('BEGIN');
     try {
       for (const r of rows) {
-        this.stmtInsertEdge.run(toNum(r.from_id), toStr(r.to_name), 'tests', toNum(r.line));
+        insert.run(toNum(r.from_id), toStr(r.to_name), toNum(r.to_id), toNum(r.line));
       }
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
     }
-    // Resolve the to_id on the new test edges. `synthesizeTestEdges` re-runs
-    // every index pass and only inserts non-duplicate rows, so this is cheap.
-    this.db.prepare(`
-      UPDATE edges SET to_id = (
-        SELECT id FROM symbols WHERE name = edges.to_name LIMIT 1
-      )
-      WHERE kind = 'tests' AND to_id IS NULL
-    `).run();
     return rows.length;
   }
 
@@ -963,6 +1423,101 @@ export class Store {
       "SELECT COUNT(*) AS c FROM edges WHERE to_name = ? AND kind = 'call'",
     ).get(symbolName) as Row;
     return toNum(row.c);
+  }
+
+  /**
+   * Callers of a specific symbol id — never collapses short-name siblings.
+   * Track E + any tool that already has a resolved symbol id should use
+   * this instead of `findCallers(name)`. Edges whose `to_id` is NULL
+   * (unresolved) are intentionally skipped: with no resolved id we can't
+   * tell whether they target THIS specific symbol vs. a same-short-name
+   * sibling, and Track E callers want id-specificity.
+   */
+  findCallersById(symbolId: number, limit?: number): CallerRow[] {
+    const hasLimit = typeof limit === 'number' && limit > 0;
+    const sql = hasLimit
+      ? `
+        SELECT
+          s.name           AS callerName,
+          s.qualified_name AS callerQualifiedName,
+          s.kind           AS callerKind,
+          f.path           AS callerFile,
+          e.line           AS callerLine,
+          e.kind           AS edgeKind
+        FROM edges e
+        JOIN symbols s ON s.id = e.from_id
+        JOIN files   f ON f.id = s.file_id
+        WHERE e.to_id = ? AND e.kind = 'call'
+        LIMIT ?
+      `
+      : `
+        SELECT
+          s.name           AS callerName,
+          s.qualified_name AS callerQualifiedName,
+          s.kind           AS callerKind,
+          f.path           AS callerFile,
+          e.line           AS callerLine,
+          e.kind           AS edgeKind
+        FROM edges e
+        JOIN symbols s ON s.id = e.from_id
+        JOIN files   f ON f.id = s.file_id
+        WHERE e.to_id = ? AND e.kind = 'call'
+        ORDER BY f.path, e.line
+      `;
+    const stmt = this.db.prepare(sql);
+    const rows = (hasLimit ? stmt.all(symbolId, limit) : stmt.all(symbolId)) as Row[];
+    const out = rows.map(r => ({
+      callerName: toStr(r.callerName),
+      callerQualifiedName: toNullStr(r.callerQualifiedName),
+      callerKind: toStr(r.callerKind),
+      callerFile: toStr(r.callerFile),
+      callerLine: toNum(r.callerLine),
+      edgeKind: toStr(r.edgeKind),
+    }));
+    if (hasLimit) {
+      out.sort((a, b) =>
+        a.callerFile < b.callerFile ? -1 :
+        a.callerFile > b.callerFile ? 1 :
+        a.callerLine - b.callerLine,
+      );
+    }
+    return out;
+  }
+
+  /** Count of callers for a specific symbol id (id-scoped). */
+  countCallersById(symbolId: number): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS c FROM edges WHERE to_id = ? AND kind = 'call'",
+    ).get(symbolId) as Row;
+    return toNum(row.c);
+  }
+
+  /**
+   * Callees emitted by a specific caller symbol id — never collapses
+   * short-name siblings the way `findCallees(name)` does. Returns one row
+   * per call edge.
+   */
+  findCalleesById(symbolId: number): CalleeRow[] {
+    const rows = this.db.prepare(`
+      SELECT
+        e.to_name        AS calleeName,
+        s2.kind          AS calleeKind,
+        f2.path          AS calleeFile,
+        s2.line_start    AS calleeLineStart,
+        e.kind           AS edgeKind
+      FROM edges e
+      LEFT JOIN symbols s2 ON s2.id = e.to_id
+      LEFT JOIN files   f2 ON f2.id = s2.file_id
+      WHERE e.from_id = ? AND e.kind = 'call'
+      ORDER BY e.line
+    `).all(symbolId) as Row[];
+    return rows.map(r => ({
+      calleeName: toStr(r.calleeName),
+      calleeKind: toNullStr(r.calleeKind),
+      calleeFile: toNullStr(r.calleeFile),
+      calleeLineStart: toNullNum(r.calleeLineStart),
+      edgeKind: toStr(r.edgeKind),
+    }));
   }
 
   findCallees(symbolName: string): CalleeRow[] {
@@ -1113,7 +1668,23 @@ export class Store {
 
   getDefinition(name: string, options: { filePath?: string } & SymbolSearchOptions = {}): SymbolRow[] {
     const filter = this.filterClauseFromOptions(options);
-    const fileClause = options.filePath ? 'AND (f.path = ? OR f.rel_path = ?)' : '';
+    // File disambiguation accepts an absolute path, the exact rel_path, OR a
+    // trailing path fragment on a segment boundary (`weird.c` matches
+    // `src/weird.c`; `auth/service.ts` matches `packages/api/auth/service.ts`).
+    // Without this an agent had to know the full rel_path or the filter
+    // silently returned nothing — a wasted round-trip. Matching stays
+    // deterministic: the fragment must align to a `/` boundary (so `auth.ts`
+    // never matches `oauth.ts`), and LIKE metacharacters are escaped so a `_`
+    // in a filename can't act as a wildcard.
+    const fp = options.filePath;
+    let fileClause = '';
+    let fileArgs: string[] = [];
+    if (fp) {
+      const norm = fp.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/,'');
+      const suffix = '%/' + escapeLike(norm);
+      fileClause = 'AND (f.path = ? OR f.rel_path = ? OR f.rel_path LIKE ? ESCAPE \'\\\')';
+      fileArgs = [fp, norm, suffix];
+    }
     const stmt = this.db.prepare(`
       SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
@@ -1123,9 +1694,7 @@ export class Store {
       ORDER BY s.pagerank DESC
       LIMIT 50
     `);
-    const rows = (options.filePath
-      ? stmt.all(name, name, options.filePath, options.filePath)
-      : stmt.all(name, name)) as Row[];
+    const rows = stmt.all(name, name, ...fileArgs) as Row[];
 
     return rows.map(toSymbolRow);
   }
@@ -1187,20 +1756,43 @@ export class Store {
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 
-  listRoutes(options: { method?: string; pathSubstr?: string; framework?: string; limit?: number } = {}): RouteRow[] {
+  listRoutes(options: {
+    method?: string;
+    pathSubstr?: string;
+    framework?: string;
+    /** v9 Track-H — filter by protocol ('http' / 'trpc' / 'graphql' / 'grpc' / 'kafka' / ...). */
+    protocol?: string;
+    operation?: string;
+    topic?: string;
+    queue?: string;
+    service?: string;
+    limit?: number;
+  } = {}): RouteRow[] {
     if (!this.hasV4Tables) return [];
+    const hasProtocol = this.hasColumn('routes', 'protocol');
     const where: string[] = [];
     const args: Array<string | number | null> = [];
     if (options.method)    { where.push('r.method = ?');           args.push(options.method.toUpperCase()); }
     if (options.pathSubstr){ where.push('r.path LIKE ?');          args.push(`%${options.pathSubstr}%`); }
     if (options.framework) { where.push('r.framework = ?');        args.push(options.framework); }
+    if (hasProtocol) {
+      if (options.protocol)  { where.push('r.protocol = ?');         args.push(options.protocol); }
+      if (options.operation) { where.push('r.operation = ?');        args.push(options.operation); }
+      if (options.topic)     { where.push('r.topic = ?');            args.push(options.topic); }
+      if (options.queue)     { where.push('r.queue = ?');            args.push(options.queue); }
+      if (options.service)   { where.push('r.service = ?');          args.push(options.service); }
+    }
     const limit = options.limit ?? 200;
+    const protocolCols = hasProtocol
+      ? ', r.protocol, r.operation, r.topic, r.queue, r.exchange, r.service, r.broker, r.metadata_json AS metadataJson'
+      : '';
     const sql = `
       SELECT r.id, r.method, r.path, r.framework, r.handler_name AS handlerName,
              r.handler_id AS handlerId,
              s.qualified_name AS handlerSymbol,
              sf.path AS handlerFile,
              f.path AS filePath, r.line
+             ${protocolCols}
       FROM routes r
       JOIN files f ON f.id = r.file_id
       LEFT JOIN symbols s ON s.id = r.handler_id
@@ -1222,6 +1814,14 @@ export class Store {
       handlerFile: toNullStr(r.handlerFile),
       filePath: toStr(r.filePath),
       line: toNum(r.line),
+      protocol: hasProtocol ? toNullStr(r.protocol) : null,
+      operation: hasProtocol ? toNullStr(r.operation) : null,
+      topic: hasProtocol ? toNullStr(r.topic) : null,
+      queue: hasProtocol ? toNullStr(r.queue) : null,
+      exchange: hasProtocol ? toNullStr(r.exchange) : null,
+      service: hasProtocol ? toNullStr(r.service) : null,
+      broker: hasProtocol ? toNullStr(r.broker) : null,
+      metadataJson: hasProtocol ? toNullStr(r.metadataJson) : null,
     }));
   }
 
@@ -1229,6 +1829,956 @@ export class Store {
     if (!this.hasV4Tables) return 0;
     const row = this.db.prepare('SELECT COUNT(*) AS c FROM routes').get() as Row;
     return toNum(row.c);
+  }
+
+  // ── v8 Track-G service calls + links ────────────────────────────────────
+
+  /** Total count of service_calls rows. */
+  countServiceCalls(): number {
+    try {
+      const row = this.db.prepare('SELECT COUNT(*) AS c FROM service_calls').get() as Row;
+      return toNum(row.c);
+    } catch { return 0; }
+  }
+
+  /** Total count of service_links rows. */
+  countServiceLinks(): number {
+    try {
+      const row = this.db.prepare('SELECT COUNT(*) AS c FROM service_links').get() as Row;
+      return toNum(row.c);
+    } catch { return 0; }
+  }
+
+  /** List service_calls with the AST-attributed caller joined in. */
+  listServiceCalls(options: {
+    protocol?: string;
+    method?: string;
+    pathSubstr?: string;
+    framework?: string;
+    callerSymbolId?: number;
+    minConfidence?: number;
+    /** v9 Track-H — filter by tRPC procedure / GraphQL operation / gRPC method. */
+    operation?: string;
+    /** v9 Track-H — filter by Kafka / pubsub topic. */
+    topic?: string;
+    /** v9 Track-H — filter by SQS / RabbitMQ queue. */
+    queue?: string;
+    /** v9 Track-H — filter by gRPC service / k8s service host. */
+    service?: string;
+    limit?: number;
+    offset?: number;
+  } = {}): import('../types.js').ServiceCallRow[] {
+    const where: string[] = [];
+    const args: Array<string | number | null> = [];
+    if (options.protocol)        { where.push('sc.protocol = ?');          args.push(options.protocol); }
+    if (options.method)          { where.push('sc.method = ?');            args.push(options.method.toUpperCase()); }
+    if (options.framework)       { where.push('sc.framework = ?');         args.push(options.framework); }
+    if (options.pathSubstr)      { where.push('sc.normalized_path LIKE ?'); args.push(`%${options.pathSubstr}%`); }
+    if (options.callerSymbolId != null) { where.push('sc.symbol_id = ?');   args.push(options.callerSymbolId); }
+    if (options.minConfidence != null)  { where.push('sc.confidence >= ?'); args.push(options.minConfidence); }
+    if (options.operation)       { where.push('sc.operation = ?');         args.push(options.operation); }
+    if (options.topic)           { where.push('sc.topic = ?');             args.push(options.topic); }
+    if (options.queue)           { where.push('sc.queue = ?');             args.push(options.queue); }
+    if (options.service)         { where.push('sc.service = ?');           args.push(options.service); }
+    const limit = Math.min(options.limit ?? 100, 1000);
+    const offset = options.offset ?? 0;
+    args.push(limit, offset);
+    const sql = `
+      SELECT sc.id, sc.protocol, sc.method, sc.raw_target AS rawTarget,
+             sc.normalized_path AS normalizedPath, sc.host_hint AS hostHint,
+             sc.env_key AS envKey, sc.framework, sc.line, sc.confidence,
+             sc.operation, sc.topic, sc.queue, sc.exchange, sc.service,
+             sc.broker, sc.metadata_json AS metadataJson,
+             f.rel_path AS filePath,
+             sc.symbol_id AS callerSymbolId,
+             s.name AS callerName, s.qualified_name AS callerQualifiedName,
+             s.kind AS callerKind
+        FROM service_calls sc
+        JOIN files f ON f.id = sc.file_id
+        LEFT JOIN symbols s ON s.id = sc.symbol_id
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY sc.id ASC
+       LIMIT ? OFFSET ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(...args) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        protocol: toStr(r.protocol),
+        method: toNullStr(r.method),
+        rawTarget: toStr(r.rawTarget),
+        normalizedPath: toNullStr(r.normalizedPath),
+        hostHint: toNullStr(r.hostHint),
+        envKey: toNullStr(r.envKey),
+        framework: toStr(r.framework),
+        line: toNum(r.line),
+        confidence: Number(r.confidence ?? 0),
+        filePath: toStr(r.filePath),
+        callerSymbolId: r.callerSymbolId == null ? null : toNum(r.callerSymbolId),
+        callerName: toNullStr(r.callerName),
+        callerQualifiedName: toNullStr(r.callerQualifiedName),
+        callerKind: toNullStr(r.callerKind),
+        operation: toNullStr(r.operation),
+        topic: toNullStr(r.topic),
+        queue: toNullStr(r.queue),
+        exchange: toNullStr(r.exchange),
+        service: toNullStr(r.service),
+        broker: toNullStr(r.broker),
+        metadataJson: toNullStr(r.metadataJson),
+      }));
+    } catch { return []; }
+  }
+
+  /** List service_links with caller + handler + route joined in. */
+  listServiceLinks(options: {
+    protocol?: string;
+    method?: string;
+    pathSubstr?: string;
+    callerSymbolId?: number;
+    handlerSymbolId?: number;
+    matchKind?: string;
+    minConfidence?: number;
+    limit?: number;
+    offset?: number;
+  } = {}): import('../types.js').ServiceLinkRow[] {
+    const where: string[] = [];
+    const args: Array<string | number | null> = [];
+    if (options.protocol)               { where.push('sl.protocol = ?');           args.push(options.protocol); }
+    if (options.matchKind)              { where.push('sl.match_kind = ?');         args.push(options.matchKind); }
+    if (options.minConfidence != null)  { where.push('sl.confidence >= ?');        args.push(options.minConfidence); }
+    if (options.callerSymbolId != null) { where.push('sl.caller_symbol_id = ?');   args.push(options.callerSymbolId); }
+    if (options.handlerSymbolId != null){ where.push('sl.handler_symbol_id = ?');  args.push(options.handlerSymbolId); }
+    if (options.method)                 { where.push('sc.method = ?');             args.push(options.method.toUpperCase()); }
+    if (options.pathSubstr)             { where.push('(sc.normalized_path LIKE ? OR r.path LIKE ?)');
+                                          args.push(`%${options.pathSubstr}%`, `%${options.pathSubstr}%`); }
+    const limit = Math.min(options.limit ?? 100, 1000);
+    const offset = options.offset ?? 0;
+    args.push(limit, offset);
+    const sql = `
+      SELECT sl.id, sl.call_id AS callId, sl.route_id AS routeId,
+             sl.protocol, sl.match_kind AS matchKind,
+             sl.confidence, sl.evidence_json AS evidenceJson,
+             sl.caller_symbol_id AS callerSymbolId,
+             cs.name AS callerName, cs.qualified_name AS callerQualifiedName,
+             cf.rel_path AS callerFile,
+             sc.line AS callerLine,
+             sc.method AS callMethod, sc.raw_target AS callRawTarget,
+             sc.normalized_path AS callNormalizedPath, sc.framework AS callFramework,
+             sc.env_key AS callEnvKey, sc.host_hint AS callHostHint,
+             sc.operation AS callOperation, sc.topic AS callTopic,
+             sc.queue AS callQueue, sc.service AS callService,
+             sl.handler_symbol_id AS handlerSymbolId,
+             hs.name AS handlerName, hs.qualified_name AS handlerQualifiedName,
+             hf.rel_path AS handlerFile, hs.line_start AS handlerLine,
+             r.method AS routeMethod, r.path AS routePath, r.framework AS routeFramework,
+             r.operation AS routeOperation, r.topic AS routeTopic,
+             r.queue AS routeQueue, r.service AS routeService
+        FROM service_links sl
+        LEFT JOIN service_calls sc ON sc.id = sl.call_id
+        LEFT JOIN files cf        ON cf.id = sc.file_id
+        LEFT JOIN symbols cs      ON cs.id = sl.caller_symbol_id
+        LEFT JOIN symbols hs      ON hs.id = sl.handler_symbol_id
+        LEFT JOIN files hf        ON hf.id = hs.file_id
+        LEFT JOIN routes r        ON r.id  = sl.route_id
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY sl.id ASC
+       LIMIT ? OFFSET ?
+    `;
+    try {
+      const rows = this.db.prepare(sql).all(...args) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        callId: toNum(r.callId),
+        routeId: r.routeId == null ? null : toNum(r.routeId),
+        protocol: toStr(r.protocol),
+        matchKind: toStr(r.matchKind),
+        confidence: Number(r.confidence ?? 0),
+        evidenceJson: toStr(r.evidenceJson),
+        callerSymbolId: r.callerSymbolId == null ? null : toNum(r.callerSymbolId),
+        callerName: toNullStr(r.callerName),
+        callerQualifiedName: toNullStr(r.callerQualifiedName),
+        callerFile: toNullStr(r.callerFile),
+        callerLine: toNum(r.callerLine ?? 0),
+        callMethod: toNullStr(r.callMethod),
+        callRawTarget: toStr(r.callRawTarget),
+        callNormalizedPath: toNullStr(r.callNormalizedPath),
+        callFramework: toStr(r.callFramework),
+        callEnvKey: toNullStr(r.callEnvKey),
+        callHostHint: toNullStr(r.callHostHint),
+        callOperation: toNullStr(r.callOperation),
+        callTopic: toNullStr(r.callTopic),
+        callQueue: toNullStr(r.callQueue),
+        callService: toNullStr(r.callService),
+        handlerSymbolId: r.handlerSymbolId == null ? null : toNum(r.handlerSymbolId),
+        handlerName: toNullStr(r.handlerName),
+        handlerQualifiedName: toNullStr(r.handlerQualifiedName),
+        handlerFile: toNullStr(r.handlerFile),
+        handlerLine: r.handlerLine == null ? null : toNum(r.handlerLine),
+        routeMethod: toNullStr(r.routeMethod),
+        routePath: toNullStr(r.routePath),
+        routeFramework: toNullStr(r.routeFramework),
+        routeOperation: toNullStr(r.routeOperation),
+        routeTopic: toNullStr(r.routeTopic),
+        routeQueue: toNullStr(r.routeQueue),
+        routeService: toNullStr(r.routeService),
+      }));
+    } catch { return []; }
+  }
+
+  /** id-scoped helper: every service_link whose caller is symbolId. */
+  serviceLinksForCaller(symbolId: number, options: { limit?: number } = {}): import('../types.js').ServiceLinkRow[] {
+    return this.listServiceLinks({ callerSymbolId: symbolId, limit: options.limit });
+  }
+
+  /** id-scoped helper: every service_link whose handler is symbolId. */
+  serviceLinksForHandler(symbolId: number, options: { limit?: number } = {}): import('../types.js').ServiceLinkRow[] {
+    return this.listServiceLinks({ handlerSymbolId: symbolId, limit: options.limit });
+  }
+
+  /**
+   * Bounded BFS over service_links from caller to handler. Treats each
+   * service_link as a directed edge `caller_symbol_id → handler_symbol_id`.
+   * Returns the shortest path as an array of symbol ids, or [] if unreachable
+   * within maxDepth. Combines with the normal call-graph trace done by
+   * `tracePath`; this one is service-link only.
+   */
+  traceServicePath(fromSymbolId: number, toSymbolId: number, maxDepth: number = 6): number[] {
+    if (fromSymbolId === toSymbolId) return [fromSymbolId];
+    if (maxDepth <= 0) return [];
+    try {
+      const stmt = this.db.prepare(
+        `SELECT DISTINCT handler_symbol_id AS h
+           FROM service_links
+          WHERE caller_symbol_id = ? AND handler_symbol_id IS NOT NULL`,
+      );
+      const parents = new Map<number, number>();
+      const visited = new Set<number>([fromSymbolId]);
+      let frontier = [fromSymbolId];
+      for (let depth = 0; depth < maxDepth; depth++) {
+        const next: number[] = [];
+        for (const cur of frontier) {
+          const rows = stmt.all(cur) as Array<{ h: unknown }>;
+          for (const r of rows) {
+            const h = toNum(r.h);
+            if (visited.has(h)) continue;
+            visited.add(h);
+            parents.set(h, cur);
+            if (h === toSymbolId) {
+              // Reconstruct path
+              const path: number[] = [h];
+              let cursor = cur;
+              while (cursor !== fromSymbolId) {
+                path.push(cursor);
+                cursor = parents.get(cursor)!;
+              }
+              path.push(fromSymbolId);
+              path.reverse();
+              return path;
+            }
+            next.push(h);
+          }
+        }
+        if (next.length === 0) break;
+        frontier = next;
+      }
+      return [];
+    } catch { return []; }
+  }
+
+  /**
+   * v9 Track-H — bounded service-link traversal from a single symbol.
+   *
+   * Walks the directed service-link graph starting at `fromSymbolId`. Each
+   * step follows `caller_symbol_id → handler_symbol_id` edges, recording the
+   * protocol / matchKind / hop chain for every reachable handler.
+   *
+   * Bounds (all configurable; defaults are conservative):
+   *   - maxDepth     limit hops away from the source (default 4)
+   *   - maxNodes     stop after expanding this many handlers (default 200)
+   *   - maxFanout    stop expanding a node after this many outgoing service
+   *                  links (default 20)
+   *
+   * Returns one record per reached handler with the protocols and match-kinds
+   * encountered along the path; `cutoff` flags the limit that fired (if any).
+   */
+  traceServiceDependencies(
+    fromSymbolId: number,
+    options: { maxDepth?: number; maxNodes?: number; maxFanout?: number } = {},
+  ): {
+    reached: Array<{
+      symbolId: number;
+      depth: number;
+      protocols: string[];
+      matchKinds: string[];
+      hops: number[];
+    }>;
+    cutoff: 'maxNodes' | 'maxDepth' | 'maxFanout' | null;
+    fromExpanded: number;
+  } {
+    const maxDepth  = options.maxDepth  ?? 4;
+    const maxNodes  = options.maxNodes  ?? 200;
+    const maxFanout = options.maxFanout ?? 20;
+
+    const reached = new Map<number, { depth: number; protocols: Set<string>; matchKinds: Set<string>; parent: number | null }>();
+    let cutoff: 'maxNodes' | 'maxDepth' | 'maxFanout' | null = null;
+    let expanded = 0;
+
+    try {
+      // Deterministic ordering by handler symbol id ASC inside each step.
+      const stmt = this.db.prepare(
+        `SELECT handler_symbol_id AS h, protocol AS p, match_kind AS mk
+           FROM service_links
+          WHERE caller_symbol_id = ? AND handler_symbol_id IS NOT NULL
+          ORDER BY confidence DESC, handler_symbol_id ASC
+          LIMIT ?`,
+      );
+
+      let frontier: number[] = [fromSymbolId];
+      let maxDepthFrontier: number[] = [];
+      reached.set(fromSymbolId, { depth: 0, protocols: new Set(), matchKinds: new Set(), parent: null });
+      for (let depth = 0; depth < maxDepth; depth++) {
+        const next: number[] = [];
+        for (const cur of frontier) {
+          // +1 so we can detect fanout-cap hits cleanly (over-by-one).
+          const rows = stmt.all(cur, maxFanout + 1) as Array<{ h: unknown; p: unknown; mk: unknown }>;
+          if (rows.length > maxFanout) cutoff = 'maxFanout';
+          for (let i = 0; i < Math.min(rows.length, maxFanout); i++) {
+            const h = toNum(rows[i].h);
+            const p = toStr(rows[i].p);
+            const mk = toStr(rows[i].mk);
+            if (reached.has(h)) {
+              const entry = reached.get(h)!;
+              entry.protocols.add(p);
+              entry.matchKinds.add(mk);
+              continue;
+            }
+            reached.set(h, {
+              depth: depth + 1,
+              protocols: new Set([p]),
+              matchKinds: new Set([mk]),
+              parent: cur,
+            });
+            next.push(h);
+            if (reached.size > maxNodes) {
+              cutoff = 'maxNodes';
+              break;
+            }
+          }
+          expanded++;
+          if (cutoff === 'maxNodes') break;
+        }
+        if (cutoff === 'maxNodes') break;
+        if (next.length === 0) break;
+        if (depth + 1 >= maxDepth) {
+          maxDepthFrontier = next;
+          break;
+        }
+        frontier = next;
+      }
+      if (!cutoff && reached.size >= maxNodes) cutoff = 'maxNodes';
+      if (!cutoff && maxDepthFrontier.length > 0) {
+        const placeholders = maxDepthFrontier.map(() => '?').join(',');
+        const row = this.db.prepare(
+          `SELECT 1 AS ok
+             FROM service_links
+            WHERE caller_symbol_id IN (${placeholders})
+              AND handler_symbol_id IS NOT NULL
+            LIMIT 1`,
+        ).get(...maxDepthFrontier) as Row | undefined;
+        if (row) cutoff = 'maxDepth';
+      }
+    } catch { /* fall through with what we have */ }
+
+    // Build hop chains for each reached handler.
+    const out: Array<{
+      symbolId: number; depth: number;
+      protocols: string[]; matchKinds: string[]; hops: number[];
+    }> = [];
+    for (const [id, entry] of reached) {
+      if (id === fromSymbolId) continue;
+      const hops: number[] = [id];
+      let p = entry.parent;
+      while (p !== null && p !== fromSymbolId) {
+        hops.push(p);
+        p = reached.get(p)?.parent ?? null;
+      }
+      hops.push(fromSymbolId);
+      hops.reverse();
+      out.push({
+        symbolId: id,
+        depth: entry.depth,
+        protocols: Array.from(entry.protocols).sort(),
+        matchKinds: Array.from(entry.matchKinds).sort(),
+        hops,
+      });
+    }
+    // Deterministic order: by depth ASC, then symbolId ASC.
+    out.sort((a, b) => a.depth - b.depth || a.symbolId - b.symbolId);
+    return { reached: out, cutoff, fromExpanded: expanded };
+  }
+
+  /**
+   * v9 Track-H — bounded service-link traversal at module granularity.
+   *
+   * Returns the set of modules reachable from `fromModuleId` by following
+   * cross-module service links (one or more service_link edges whose caller
+   * and handler live in different modules). For each reached module the
+   * result includes the minimum hop depth and which protocols carry traffic
+   * into it.
+   *
+   * Useful for "which modules depend on `billing` through HTTP/Kafka/etc?".
+   */
+  traceModuleServiceDependencies(
+    fromModuleId: number,
+    options: { maxDepth?: number; maxNodes?: number } = {},
+  ): {
+    reached: Array<{ moduleId: number; depth: number; protocols: string[]; viaLinks: number }>;
+    cutoff: 'maxNodes' | 'maxDepth' | null;
+  } {
+    const maxDepth = options.maxDepth ?? 3;
+    const maxNodes = options.maxNodes ?? 50;
+    if (!this.hasModuleTables) return { reached: [], cutoff: null };
+
+    // Materialize module → module service-link weights once for the BFS.
+    type ModuleEdge = { from: number; to: number; protocol: string; n: number };
+    const edges = this.db.prepare(
+      `SELECT mm1.module_id AS f, mm2.module_id AS t, sl.protocol AS p, COUNT(*) AS n
+         FROM service_links sl
+         JOIN service_calls sc ON sc.id = sl.call_id
+         JOIN module_members mm1 ON mm1.file_id = sc.file_id
+         JOIN symbols hs ON hs.id = sl.handler_symbol_id
+         JOIN module_members mm2 ON mm2.file_id = hs.file_id
+        WHERE mm1.module_id <> mm2.module_id
+        GROUP BY mm1.module_id, mm2.module_id, sl.protocol
+        ORDER BY mm1.module_id ASC, mm2.module_id ASC, sl.protocol ASC`,
+    ).all() as Array<{ f: unknown; t: unknown; p: unknown; n: unknown }>;
+    const adj = new Map<number, ModuleEdge[]>();
+    for (const e of edges) {
+      const from = toNum(e.f);
+      const list = adj.get(from) ?? [];
+      list.push({ from, to: toNum(e.t), protocol: toStr(e.p), n: toNum(e.n) });
+      adj.set(from, list);
+    }
+
+    type Reached = { depth: number; protocols: Set<string>; viaLinks: number };
+    const reached = new Map<number, Reached>();
+    reached.set(fromModuleId, { depth: 0, protocols: new Set(), viaLinks: 0 });
+    let cutoff: 'maxNodes' | 'maxDepth' | null = null;
+
+    let frontier: number[] = [fromModuleId];
+    let maxDepthFrontier: number[] = [];
+    for (let depth = 0; depth < maxDepth; depth++) {
+      const next: number[] = [];
+      for (const cur of frontier) {
+        const outs = adj.get(cur) ?? [];
+        for (const e of outs) {
+          if (e.to === fromModuleId) continue;
+          let entry = reached.get(e.to);
+          if (!entry) {
+            entry = { depth: depth + 1, protocols: new Set(), viaLinks: 0 };
+            reached.set(e.to, entry);
+            next.push(e.to);
+            if (reached.size > maxNodes) { cutoff = 'maxNodes'; break; }
+          }
+          entry.protocols.add(e.protocol);
+          entry.viaLinks += e.n;
+        }
+        if (cutoff) break;
+      }
+      if (cutoff) break;
+      if (next.length === 0) break;
+      if (depth + 1 >= maxDepth) {
+        maxDepthFrontier = next;
+        break;
+      }
+      frontier = next;
+    }
+    if (!cutoff && maxDepthFrontier.some(id => (adj.get(id)?.length ?? 0) > 0)) {
+      cutoff = 'maxDepth';
+    }
+
+    const out: Array<{ moduleId: number; depth: number; protocols: string[]; viaLinks: number }> = [];
+    for (const [id, r] of reached) {
+      if (id === fromModuleId) continue;
+      out.push({
+        moduleId: id, depth: r.depth,
+        protocols: Array.from(r.protocols).sort(),
+        viaLinks: r.viaLinks,
+      });
+    }
+    out.sort((a, b) => a.depth - b.depth || a.moduleId - b.moduleId);
+    return { reached: out, cutoff };
+  }
+
+  // ── v10 External bundle layers ─────────────────────────────────────────────
+
+  /** True iff the v10 external/boundary/continuity tables exist on disk. */
+  hasV10(): boolean { return this.hasV10Tables; }
+
+  /** Replace the boundaries / boundary_members / boundary_edges tables.
+   *  Atomic — wrapped in a single transaction. */
+  replaceBoundaries(
+    boundaries: Array<{
+      label: string;
+      kind: string;
+      rootRelPath: string;
+      manifestPath: string | null;
+      ecosystem: string | null;
+      fileIds: number[];
+    }>,
+    edges: Array<{ fromIndex: number; toIndex: number; kind: string; weight: number }>,
+  ): void {
+    this.assertWritable();
+    if (!this.hasV10Tables) return;
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec('DELETE FROM boundary_edges');
+      this.db.exec('DELETE FROM boundary_members');
+      this.db.exec('DELETE FROM boundaries');
+      const insBoundary = this.db.prepare(`
+        INSERT INTO boundaries
+          (label, kind, root_rel_path, manifest_path, ecosystem, size_files, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insMember = this.db.prepare(
+        'INSERT OR REPLACE INTO boundary_members (file_id, boundary_id) VALUES (?, ?)',
+      );
+      const insEdge = this.db.prepare(
+        'INSERT OR REPLACE INTO boundary_edges (from_boundary_id, to_boundary_id, kind, weight) VALUES (?, ?, ?, ?)',
+      );
+      const now = Date.now();
+      const indexToId: number[] = [];
+      for (const b of boundaries) {
+        const res = insBoundary.run(
+          b.label, b.kind, b.rootRelPath, b.manifestPath, b.ecosystem,
+          b.fileIds.length, now,
+        );
+        const id = toNum(res.lastInsertRowid);
+        indexToId.push(id);
+        for (const fid of b.fileIds) insMember.run(fid, id);
+      }
+      for (const e of edges) {
+        const f = indexToId[e.fromIndex];
+        const t = indexToId[e.toIndex];
+        if (f == null || t == null) continue;
+        insEdge.run(f, t, e.kind, e.weight);
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /** True iff boundaries were populated this build. */
+  hasBoundariesData(): boolean {
+    if (!this.hasV10Tables) return false;
+    try {
+      const row = this.db.prepare('SELECT COUNT(*) AS c FROM boundaries').get() as Row;
+      return toNum(row.c) > 0;
+    } catch { return false; }
+  }
+
+  countBoundaries(): number {
+    if (!this.hasV10Tables) return 0;
+    try {
+      return toNum((this.db.prepare('SELECT COUNT(*) AS c FROM boundaries').get() as Row).c);
+    } catch { return 0; }
+  }
+
+  listBoundaries(limit = 200): Array<{
+    id: number; label: string; kind: string; rootRelPath: string;
+    manifestPath: string | null; ecosystem: string | null; sizeFiles: number;
+  }> {
+    if (!this.hasV10Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT id, label, kind, root_rel_path AS rootRelPath,
+               manifest_path AS manifestPath, ecosystem,
+               size_files AS sizeFiles
+        FROM boundaries
+        ORDER BY size_files DESC, label
+        LIMIT ?
+      `).all(limit) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id), label: toStr(r.label), kind: toStr(r.kind),
+        rootRelPath: toStr(r.rootRelPath),
+        manifestPath: toNullStr(r.manifestPath),
+        ecosystem: toNullStr(r.ecosystem),
+        sizeFiles: toNum(r.sizeFiles),
+      }));
+    } catch { return []; }
+  }
+
+  /** Boundary that owns a file id (or null). */
+  boundaryForFile(fileId: number): { id: number; label: string; kind: string; rootRelPath: string } | null {
+    if (!this.hasV10Tables) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT b.id, b.label, b.kind, b.root_rel_path AS rootRelPath
+        FROM boundary_members bm JOIN boundaries b ON b.id = bm.boundary_id
+        WHERE bm.file_id = ?
+      `).get(fileId) as Row | undefined;
+      if (!row) return null;
+      return {
+        id: toNum(row.id),
+        label: toStr(row.label),
+        kind: toStr(row.kind),
+        rootRelPath: toStr(row.rootRelPath),
+      };
+    } catch { return null; }
+  }
+
+  /** Cross-boundary dependency edges from a boundary (outgoing by default). */
+  boundaryDependencies(
+    boundaryId: number,
+    options: { direction?: 'in' | 'out'; limit?: number } = {},
+  ): Array<{ boundaryId: number; label: string; kind: string; weight: number }> {
+    if (!this.hasV10Tables) return [];
+    const direction = options.direction ?? 'out';
+    const limit = options.limit ?? 100;
+    const sideThis = direction === 'out' ? 'from_boundary_id' : 'to_boundary_id';
+    const sideOther = direction === 'out' ? 'to_boundary_id' : 'from_boundary_id';
+    try {
+      const rows = this.db.prepare(`
+        SELECT b.id AS boundaryId, b.label, be.kind, be.weight
+        FROM boundary_edges be JOIN boundaries b ON b.id = be.${sideOther}
+        WHERE be.${sideThis} = ?
+        ORDER BY be.weight DESC
+        LIMIT ?
+      `).all(boundaryId, limit) as Row[];
+      return rows.map(r => ({
+        boundaryId: toNum(r.boundaryId),
+        label: toStr(r.label),
+        kind: toStr(r.kind),
+        weight: toNum(r.weight),
+      }));
+    } catch { return []; }
+  }
+
+  /** For a given symbol id, return the boundaries of each of its callees. */
+  calleeBoundariesOf(symbolId: number): Array<{ calleeId: number; boundaryId: number }> {
+    if (!this.hasV10Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT DISTINCT e.to_id AS calleeId, bm.boundary_id AS boundaryId
+        FROM edges e
+        JOIN symbols s ON s.id = e.to_id
+        JOIN boundary_members bm ON bm.file_id = s.file_id
+        WHERE e.from_id = ? AND e.kind = 'call' AND e.to_id IS NOT NULL
+      `).all(symbolId) as Row[];
+      return rows.map(r => ({
+        calleeId: toNum(r.calleeId), boundaryId: toNum(r.boundaryId),
+      }));
+    } catch { return []; }
+  }
+
+  /**
+   * Return every files.id that's actually a phantom file backing an external
+   * bundle layer. The indexer's prune pass preserves these so a local
+   * re-index never drops external-imported rows.
+   */
+  listExternalPhantomFileIds(): number[] {
+    try {
+      const rows = this.db.prepare(
+        "SELECT id FROM files WHERE path LIKE '__external_bundle__/%'",
+      ).all() as Row[];
+      return rows.map(r => toNum(r.id));
+    } catch { return []; }
+  }
+
+  /** Insert (or replace) an external_bundles row for a given bundle path. */
+  upsertExternalBundle(args: {
+    bundlePath: string;
+    externalProject: string | null;
+    externalVersion: string | null;
+    externalHash: string | null;
+    schemaVersion: number;
+    routesImported: number;
+    serviceCallsImported: number;
+    serviceLinksImported: number;
+  }): number {
+    this.assertWritable();
+    if (!this.hasV10Tables) return 0;
+    const existing = this.db.prepare(
+      'SELECT id FROM external_bundles WHERE bundle_path = ?',
+    ).get(args.bundlePath) as Row | undefined;
+    if (existing) {
+      const id = toNum(existing.id);
+      this.db.prepare(`
+        UPDATE external_bundles
+        SET external_project = ?, external_version = ?, external_hash = ?,
+            schema_version = ?, imported_at = ?, routes_imported = ?,
+            service_calls_imported = ?, service_links_imported = ?
+        WHERE id = ?
+      `).run(
+        args.externalProject, args.externalVersion, args.externalHash,
+        args.schemaVersion, Date.now(),
+        args.routesImported, args.serviceCallsImported, args.serviceLinksImported,
+        id,
+      );
+      return id;
+    }
+    const r = this.db.prepare(`
+      INSERT INTO external_bundles
+        (source_kind, bundle_path, external_project, external_version, external_hash,
+         schema_version, imported_at, routes_imported, service_calls_imported, service_links_imported)
+      VALUES ('external-bundle', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      args.bundlePath, args.externalProject, args.externalVersion, args.externalHash,
+      args.schemaVersion, Date.now(),
+      args.routesImported, args.serviceCallsImported, args.serviceLinksImported,
+    );
+    return toNum(r.lastInsertRowid);
+  }
+
+  /**
+   * Look up an existing external_bundles row by its bundle path. Returns the
+   * id and the imported_at/external_hash for the existing layer when present.
+   */
+  findExternalBundleByPath(bundlePath: string): {
+    id: number; bundlePath: string; externalProject: string | null;
+    externalVersion: string | null; externalHash: string | null;
+  } | null {
+    if (!this.hasV10Tables) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT id, bundle_path AS bundlePath, external_project AS externalProject,
+               external_version AS externalVersion, external_hash AS externalHash
+        FROM external_bundles WHERE bundle_path = ?
+      `).get(bundlePath) as Row | undefined;
+      if (!row) return null;
+      return {
+        id: toNum(row.id),
+        bundlePath: toStr(row.bundlePath),
+        externalProject: toNullStr(row.externalProject),
+        externalVersion: toNullStr(row.externalVersion),
+        externalHash: toNullStr(row.externalHash),
+      };
+    } catch { return null; }
+  }
+
+  /** List every external_bundles row (newest first). */
+  listExternalBundles(): Array<{
+    id: number; sourceKind: string; bundlePath: string;
+    externalProject: string | null; externalVersion: string | null;
+    externalHash: string | null; schemaVersion: number; importedAt: number;
+    routesImported: number; serviceCallsImported: number; serviceLinksImported: number;
+  }> {
+    if (!this.hasV10Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT id, source_kind AS sourceKind, bundle_path AS bundlePath,
+               external_project AS externalProject,
+               external_version AS externalVersion,
+               external_hash AS externalHash,
+               schema_version AS schemaVersion,
+               imported_at AS importedAt,
+               routes_imported AS routesImported,
+               service_calls_imported AS serviceCallsImported,
+               service_links_imported AS serviceLinksImported
+        FROM external_bundles
+        ORDER BY imported_at DESC
+      `).all() as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        sourceKind: toStr(r.sourceKind),
+        bundlePath: toStr(r.bundlePath),
+        externalProject: toNullStr(r.externalProject),
+        externalVersion: toNullStr(r.externalVersion),
+        externalHash: toNullStr(r.externalHash),
+        schemaVersion: toNum(r.schemaVersion),
+        importedAt: toNum(r.importedAt),
+        routesImported: toNum(r.routesImported),
+        serviceCallsImported: toNum(r.serviceCallsImported),
+        serviceLinksImported: toNum(r.serviceLinksImported),
+      }));
+    } catch { return []; }
+  }
+
+  /**
+   * Delete every row associated with a given external_bundles.id — its
+   * routes/service_calls/service_links rows and the bundle row itself. Used
+   * during re-import so a fresh import is fully replacing the previous
+   * snapshot of that bundle.
+   */
+  clearExternalBundle(bundleId: number): {
+    routes: number; serviceCalls: number; serviceLinks: number;
+  } {
+    this.assertWritable();
+    if (!this.hasV10Tables) return { routes: 0, serviceCalls: 0, serviceLinks: 0 };
+    let routes = 0, serviceCalls = 0, serviceLinks = 0;
+    this.db.exec('BEGIN');
+    try {
+      try {
+        routes = toNum(this.db.prepare(
+          'DELETE FROM routes WHERE external_bundle_id = ?',
+        ).run(bundleId).changes);
+      } catch { /* */ }
+      try {
+        serviceCalls = toNum(this.db.prepare(
+          'DELETE FROM service_calls WHERE external_bundle_id = ?',
+        ).run(bundleId).changes);
+      } catch { /* */ }
+      try {
+        serviceLinks = toNum(this.db.prepare(
+          'DELETE FROM service_links WHERE external_bundle_id = ?',
+        ).run(bundleId).changes);
+      } catch { /* */ }
+      // Drop the phantom file row that owned this layer's external routes so a
+      // forced re-import (which mints a new bundle id + phantom path) does not
+      // leak orphaned `__external_bundle__/...` rows alongside sibling layers.
+      try {
+        this.db.prepare(
+          "DELETE FROM files WHERE hash = ? AND path LIKE '__external_bundle__/%'",
+        ).run(`external:${bundleId}`);
+      } catch { /* */ }
+      this.db.prepare('DELETE FROM external_bundles WHERE id = ?').run(bundleId);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return { routes, serviceCalls, serviceLinks };
+  }
+
+  /**
+   * Insert a route from an external bundle. file_id is intentionally NULL —
+   * external routes do not belong to any local file. The Store schema does
+   * not allow NULL on routes.file_id by default; v10 keeps file_id NOT NULL,
+   * so we have to ensure an external "phantom" file row exists per bundle to
+   * own the routes. The route stays linked to the external_bundle_id so we
+   * can wipe them as a layer.
+   */
+  insertExternalRoute(args: {
+    bundleId: number;
+    externalFileId: number;
+    method: string;
+    path: string;
+    framework: string;
+    handlerName: string | null;
+    line: number;
+    protocol?: string;
+    operation?: string | null;
+    topic?: string | null;
+    queue?: string | null;
+    exchange?: string | null;
+    service?: string | null;
+    broker?: string | null;
+    metadataJson?: string | null;
+  }): number {
+    this.assertWritable();
+    if (!this.hasV10Tables) return 0;
+    const r = this.db.prepare(`
+      INSERT INTO routes
+        (file_id, method, path, framework, handler_name, line,
+         protocol, operation, topic, queue, exchange, service, broker, metadata_json,
+         external_bundle_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      args.externalFileId, args.method, args.path, args.framework, args.handlerName, args.line,
+      args.protocol ?? 'http',
+      args.operation ?? null, args.topic ?? null, args.queue ?? null,
+      args.exchange ?? null, args.service ?? null, args.broker ?? null,
+      args.metadataJson ?? null,
+      args.bundleId,
+    );
+    return toNum(r.lastInsertRowid);
+  }
+
+  /**
+   * Create (or reuse) an "external" phantom file row that owns external
+   * bundle rows. Each external_bundles.id gets its own external-phantom file
+   * so deleting a layer doesn't disturb sibling layers. The phantom file
+   * carries role='vendor' so it stays out of project-first defaults.
+   */
+  ensureExternalFile(bundleId: number, externalProject: string): number {
+    this.assertWritable();
+    const phantomPath = `__external_bundle__/${externalProject}/${bundleId}`;
+    const existing = this.db.prepare('SELECT id FROM files WHERE path = ?')
+      .get(phantomPath) as Row | undefined;
+    if (existing) return toNum(existing.id);
+    const r = this.stmtUpsertFile.run(
+      phantomPath, phantomPath, 'external',
+      `external:${bundleId}`, 0, Date.now(),
+      'vendor', 1, 0,
+    );
+    return toNum(r.lastInsertRowid);
+  }
+
+  /** Count of routes that came from an external bundle. */
+  countExternalRoutes(): number {
+    if (!this.hasV10Tables) return 0;
+    try {
+      const row = this.db.prepare(
+        'SELECT COUNT(*) AS c FROM routes WHERE external_bundle_id IS NOT NULL',
+      ).get() as Row;
+      return toNum(row.c);
+    } catch { return 0; }
+  }
+
+  /**
+   * List routes filtered to external bundles only. Useful for verifying that
+   * an external import landed and for the seer_external_bundles MCP tool.
+   */
+  listExternalRoutes(options: {
+    bundleId?: number;
+    method?: string;
+    pathSubstr?: string;
+    protocol?: string;
+    limit?: number;
+  } = {}): Array<{
+    id: number;
+    method: string;
+    path: string;
+    framework: string;
+    handlerName: string | null;
+    line: number;
+    protocol: string | null;
+    operation: string | null;
+    topic: string | null;
+    queue: string | null;
+    service: string | null;
+    externalBundleId: number;
+    externalProject: string | null;
+  }> {
+    if (!this.hasV10Tables) return [];
+    const where: string[] = ['r.external_bundle_id IS NOT NULL'];
+    const args: Array<string | number | null> = [];
+    if (options.bundleId != null) { where.push('r.external_bundle_id = ?'); args.push(options.bundleId); }
+    if (options.method)           { where.push('r.method = ?');             args.push(options.method.toUpperCase()); }
+    if (options.pathSubstr)       { where.push('r.path LIKE ?');            args.push(`%${options.pathSubstr}%`); }
+    if (options.protocol)         { where.push('r.protocol = ?');           args.push(options.protocol); }
+    const limit = options.limit ?? 200;
+    args.push(limit);
+    try {
+      const rows = this.db.prepare(`
+        SELECT r.id, r.method, r.path, r.framework, r.handler_name AS handlerName,
+               r.line, r.protocol, r.operation, r.topic, r.queue, r.service,
+               r.external_bundle_id AS externalBundleId,
+               eb.external_project AS externalProject
+        FROM routes r
+        JOIN external_bundles eb ON eb.id = r.external_bundle_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY r.path, r.method
+        LIMIT ?
+      `).all(...args) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        method: toStr(r.method),
+        path: toStr(r.path),
+        framework: toStr(r.framework),
+        handlerName: toNullStr(r.handlerName),
+        line: toNum(r.line),
+        protocol: toNullStr(r.protocol),
+        operation: toNullStr(r.operation),
+        topic: toNullStr(r.topic),
+        queue: toNullStr(r.queue),
+        service: toNullStr(r.service),
+        externalBundleId: toNum(r.externalBundleId),
+        externalProject: toNullStr(r.externalProject),
+      }));
+    } catch { return []; }
   }
 
   // ── External dependencies ───────────────────────────────────────────────────
@@ -1645,6 +3195,560 @@ export class Store {
   }
 
   /**
+   * Bounded reverse-reachable callers WITH depth, for risk/context callers.
+   * Same termination semantics as reverseReachable() but returns the depth
+   * at which each id was first discovered (1-indexed; direct callers = 1).
+   */
+  reverseReachableWithDepth(
+    toId: number,
+    maxDepth = 4,
+    maxNodes = 20_000,
+  ): Array<{ id: number; depth: number }> {
+    const stmt = this.db.prepare(
+      "SELECT DISTINCT from_id FROM edges WHERE to_id = ? AND kind = 'call'",
+    );
+    const seen = new Map<number, number>([[toId, 0]]);
+    const queue: Array<{ id: number; depth: number }> = [{ id: toId, depth: 0 }];
+    while (queue.length > 0) {
+      const { id, depth } = queue.shift()!;
+      if (seen.size > maxNodes) break;
+      if (depth >= maxDepth) continue;
+      const rows = stmt.all(id) as Row[];
+      for (const r of rows) {
+        const next = toNum(r.from_id);
+        if (seen.has(next)) continue;
+        seen.set(next, depth + 1);
+        queue.push({ id: next, depth: depth + 1 });
+      }
+    }
+    seen.delete(toId);
+    return Array.from(seen.entries()).map(([id, depth]) => ({ id, depth }));
+  }
+
+  /**
+   * Bounded forward-reachable callees with depth — for callee blast-radius
+   * questions and behavioral indirect-coverage. Mirror of
+   * reverseReachableWithDepth().
+   */
+  forwardReachableWithDepth(
+    fromId: number,
+    maxDepth = 4,
+    maxNodes = 20_000,
+  ): Array<{ id: number; depth: number }> {
+    const stmt = this.db.prepare(
+      "SELECT DISTINCT to_id FROM edges WHERE from_id = ? AND to_id IS NOT NULL AND kind = 'call'",
+    );
+    const seen = new Map<number, number>([[fromId, 0]]);
+    const queue: Array<{ id: number; depth: number }> = [{ id: fromId, depth: 0 }];
+    while (queue.length > 0) {
+      const { id, depth } = queue.shift()!;
+      if (seen.size > maxNodes) break;
+      if (depth >= maxDepth) continue;
+      const rows = stmt.all(id) as Row[];
+      for (const r of rows) {
+        const next = toNum(r.to_id);
+        if (seen.has(next)) continue;
+        seen.set(next, depth + 1);
+        queue.push({ id: next, depth: depth + 1 });
+      }
+    }
+    seen.delete(fromId);
+    return Array.from(seen.entries()).map(([id, depth]) => ({ id, depth }));
+  }
+
+  /**
+   * Bounded BFS over the file-import graph. Used by
+   * seer_trace_file_dependencies — returns each reachable file with the BFS
+   * depth at which we first saw it.
+   */
+  fileImportClosure(
+    fileId: number,
+    maxDepth = 4,
+    maxNodes = 5_000,
+  ): Array<{ id: number; depth: number; relPath: string; language: string }> {
+    const stmt = this.db.prepare(
+      'SELECT DISTINCT resolved_file_id FROM file_imports WHERE from_file_id = ? AND resolved_file_id IS NOT NULL',
+    );
+    const seen = new Map<number, number>([[fileId, 0]]);
+    const queue: Array<{ id: number; depth: number }> = [{ id: fileId, depth: 0 }];
+    while (queue.length > 0) {
+      const { id, depth } = queue.shift()!;
+      if (seen.size > maxNodes) break;
+      if (depth >= maxDepth) continue;
+      const rows = stmt.all(id) as Row[];
+      for (const r of rows) {
+        const next = toNum(r.resolved_file_id);
+        if (seen.has(next)) continue;
+        seen.set(next, depth + 1);
+        queue.push({ id: next, depth: depth + 1 });
+      }
+    }
+    seen.delete(fileId);
+    if (seen.size === 0) return [];
+    const ids = Array.from(seen.keys());
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(
+      `SELECT id, rel_path AS relPath, language FROM files WHERE id IN (${placeholders})`,
+    ).all(...ids) as Row[];
+    const meta = new Map(rows.map(r => [
+      toNum(r.id),
+      { relPath: toStr(r.relPath), language: toStr(r.language) },
+    ]));
+    return ids.map(id => {
+      const m = meta.get(id);
+      return {
+        id,
+        depth: seen.get(id)!,
+        relPath: m?.relPath ?? '',
+        language: m?.language ?? '',
+      };
+    });
+  }
+
+  // ── Track-E: file/module aggregate graph helpers ────────────────────────────
+
+  /**
+   * All cross-file call edges as (fromFile, toFile, weight) triples.
+   * Used by the Louvain clusterer; only resolved 'call' edges count.
+   */
+  fileCallEdgeWeights(): Array<{ from: number; to: number; weight: number }> {
+    const rows = this.db.prepare(`
+      SELECT sf.file_id AS fromFile, st.file_id AS toFile, COUNT(*) AS w
+      FROM edges e
+      JOIN symbols sf ON sf.id = e.from_id
+      JOIN symbols st ON st.id = e.to_id
+      WHERE e.kind = 'call' AND e.to_id IS NOT NULL
+        AND sf.file_id <> st.file_id
+      GROUP BY sf.file_id, st.file_id
+    `).all() as Row[];
+    return rows.map(r => ({
+      from: toNum(r.fromFile),
+      to: toNum(r.toFile),
+      weight: toNum(r.w),
+    }));
+  }
+
+  /** Resolved cross-file import edges as (fromFile, toFile, weight). */
+  fileImportEdgeWeights(): Array<{ from: number; to: number; weight: number }> {
+    const rows = this.db.prepare(`
+      SELECT from_file_id AS fromFile, resolved_file_id AS toFile, COUNT(*) AS w
+      FROM file_imports
+      WHERE resolved_file_id IS NOT NULL
+        AND from_file_id <> resolved_file_id
+      GROUP BY from_file_id, resolved_file_id
+    `).all() as Row[];
+    return rows.map(r => ({
+      from: toNum(r.fromFile),
+      to: toNum(r.toFile),
+      weight: toNum(r.w),
+    }));
+  }
+
+  /** Synthesized test → production edges, file-aggregated. */
+  fileTestEdgeWeights(): Array<{ from: number; to: number; weight: number }> {
+    const rows = this.db.prepare(`
+      SELECT sf.file_id AS fromFile, st.file_id AS toFile, COUNT(*) AS w
+      FROM edges e
+      JOIN symbols sf ON sf.id = e.from_id
+      JOIN symbols st ON st.id = e.to_id
+      WHERE e.kind = 'tests' AND e.to_id IS NOT NULL
+        AND sf.file_id <> st.file_id
+      GROUP BY sf.file_id, st.file_id
+    `).all() as Row[];
+    return rows.map(r => ({
+      from: toNum(r.fromFile),
+      to: toNum(r.toFile),
+      weight: toNum(r.w),
+    }));
+  }
+
+  /**
+   * v8 Track-G — service-link file-aggregated edges. Each link contributes one
+   * cross-file edge from the call-site file (service_calls.file_id) to the
+   * handler-symbol's file. Used by the module clusterer to surface
+   * client→handler dependencies as architecturally important.
+   */
+  fileServiceLinkEdgeWeights(): Array<{ from: number; to: number; weight: number }> {
+    try {
+      const rows = this.db.prepare(`
+        SELECT sc.file_id AS fromFile, hs.file_id AS toFile, COUNT(*) AS w
+          FROM service_links sl
+          JOIN service_calls sc ON sc.id = sl.call_id
+          LEFT JOIN symbols hs  ON hs.id = sl.handler_symbol_id
+         WHERE hs.file_id IS NOT NULL
+           AND sc.file_id <> hs.file_id
+         GROUP BY sc.file_id, hs.file_id
+      `).all() as Row[];
+      return rows.map(r => ({
+        from: toNum(r.fromFile),
+        to: toNum(r.toFile),
+        weight: toNum(r.w),
+      }));
+    } catch { return []; }
+  }
+
+  /** All file ids + their language + rel path — feeds the clusterer. */
+  listFileSummaries(): Array<{ id: number; relPath: string; language: string; role: string }> {
+    const rows = this.db.prepare(
+      'SELECT id, rel_path AS relPath, language, role FROM files',
+    ).all() as Row[];
+    return rows.map(r => ({
+      id: toNum(r.id), relPath: toStr(r.relPath),
+      language: toStr(r.language), role: toStr(r.role),
+    }));
+  }
+
+  // ── Track-E: modules persistence ────────────────────────────────────────────
+
+  /**
+   * Replace the modules / module_members / module_edges tables with the
+   * provided clustering. Atomic — wrapped in a single transaction so a
+   * partial write can't leave inconsistent membership.
+   */
+  replaceModules(
+    modules: Array<{
+      label: string;
+      sizeFiles: number;
+      sizeSymbols: number;
+      primaryLanguage: string | null;
+      cohesion: number;
+      centrality: number;
+      fileIds: number[];
+    }>,
+    edges: Array<{ fromIndex: number; toIndex: number; kind: string; weight: number }>,
+    algorithm = 'louvain',
+  ): void {
+    if (!this.hasModuleTables) return;
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec('DELETE FROM module_edges');
+      this.db.exec('DELETE FROM module_members');
+      this.db.exec('DELETE FROM modules');
+      const insModule = this.db.prepare(`
+        INSERT INTO modules (label, size_files, size_symbols, primary_language, cohesion, centrality, computed_at, algorithm)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insMember = this.db.prepare(
+        'INSERT INTO module_members (file_id, module_id) VALUES (?, ?)',
+      );
+      const insEdge = this.db.prepare(
+        'INSERT OR REPLACE INTO module_edges (from_module_id, to_module_id, kind, weight) VALUES (?, ?, ?, ?)',
+      );
+      const now = Date.now();
+      const indexToId: number[] = [];
+      for (const m of modules) {
+        const res = insModule.run(
+          m.label, m.sizeFiles, m.sizeSymbols, m.primaryLanguage,
+          m.cohesion, m.centrality, now, algorithm,
+        );
+        const id = toNum(res.lastInsertRowid);
+        indexToId.push(id);
+        for (const fid of m.fileIds) insMember.run(fid, id);
+      }
+      for (const e of edges) {
+        const f = indexToId[e.fromIndex];
+        const t = indexToId[e.toIndex];
+        if (f == null || t == null) continue;
+        insEdge.run(f, t, e.kind, e.weight);
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  hasModulesData(): boolean {
+    if (!this.hasModuleTables) return false;
+    try {
+      const row = this.db.prepare('SELECT COUNT(*) AS c FROM modules').get() as Row;
+      return toNum(row.c) > 0;
+    } catch { return false; }
+  }
+
+  countModules(): number {
+    if (!this.hasModuleTables) return 0;
+    try {
+      return toNum((this.db.prepare('SELECT COUNT(*) AS c FROM modules').get() as Row).c);
+    } catch { return 0; }
+  }
+
+  listModules(options: { limit?: number; sortBy?: 'centrality' | 'size' | 'label' } = {}): Array<{
+    id: number; label: string; sizeFiles: number; sizeSymbols: number;
+    primaryLanguage: string | null; cohesion: number; centrality: number;
+  }> {
+    if (!this.hasModuleTables) return [];
+    const limit = options.limit ?? 100;
+    const sortBy = options.sortBy ?? 'centrality';
+    const order =
+      sortBy === 'label' ? 'label ASC'
+      : sortBy === 'size' ? 'size_files DESC, size_symbols DESC'
+      : 'centrality DESC, size_files DESC';
+    try {
+      const rows = this.db.prepare(`
+        SELECT id, label, size_files AS sizeFiles, size_symbols AS sizeSymbols,
+               primary_language AS primaryLanguage, cohesion, centrality
+        FROM modules
+        ORDER BY ${order}
+        LIMIT ?
+      `).all(limit) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        label: toStr(r.label),
+        sizeFiles: toNum(r.sizeFiles),
+        sizeSymbols: toNum(r.sizeSymbols),
+        primaryLanguage: toNullStr(r.primaryLanguage),
+        cohesion: Number(r.cohesion),
+        centrality: Number(r.centrality),
+      }));
+    } catch { return []; }
+  }
+
+  getModuleById(id: number): {
+    id: number; label: string; sizeFiles: number; sizeSymbols: number;
+    primaryLanguage: string | null; cohesion: number; centrality: number;
+  } | null {
+    if (!this.hasModuleTables) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT id, label, size_files AS sizeFiles, size_symbols AS sizeSymbols,
+               primary_language AS primaryLanguage, cohesion, centrality
+        FROM modules WHERE id = ?
+      `).get(id) as Row | undefined;
+      if (!row) return null;
+      return {
+        id: toNum(row.id),
+        label: toStr(row.label),
+        sizeFiles: toNum(row.sizeFiles),
+        sizeSymbols: toNum(row.sizeSymbols),
+        primaryLanguage: toNullStr(row.primaryLanguage),
+        cohesion: Number(row.cohesion),
+        centrality: Number(row.centrality),
+      };
+    } catch { return null; }
+  }
+
+  /** Module label → row. Used by CLI/MCP module lookups by name. */
+  getModuleByLabel(label: string): {
+    id: number; label: string; sizeFiles: number; sizeSymbols: number;
+    primaryLanguage: string | null; cohesion: number; centrality: number;
+  } | null {
+    if (!this.hasModuleTables) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT id, label, size_files AS sizeFiles, size_symbols AS sizeSymbols,
+               primary_language AS primaryLanguage, cohesion, centrality
+        FROM modules WHERE label = ?
+      `).get(label) as Row | undefined;
+      if (!row) return null;
+      return {
+        id: toNum(row.id),
+        label: toStr(row.label),
+        sizeFiles: toNum(row.sizeFiles),
+        sizeSymbols: toNum(row.sizeSymbols),
+        primaryLanguage: toNullStr(row.primaryLanguage),
+        cohesion: Number(row.cohesion),
+        centrality: Number(row.centrality),
+      };
+    } catch { return null; }
+  }
+
+  /**
+   * Files in a module, sorted by file path. Returns empty array if the
+   * module id doesn't exist or modules haven't been built.
+   */
+  listModuleMembers(moduleId: number, limit = 1000): Array<{
+    fileId: number; path: string; relPath: string; language: string; role: string;
+  }> {
+    if (!this.hasModuleTables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT f.id AS fileId, f.path, f.rel_path AS relPath, f.language, f.role
+        FROM module_members mm
+        JOIN files f ON f.id = mm.file_id
+        WHERE mm.module_id = ?
+        ORDER BY f.rel_path
+        LIMIT ?
+      `).all(moduleId, limit) as Row[];
+      return rows.map(r => ({
+        fileId: toNum(r.fileId), path: toStr(r.path), relPath: toStr(r.relPath),
+        language: toStr(r.language), role: toStr(r.role),
+      }));
+    } catch { return []; }
+  }
+
+  /** Top symbols (by PageRank) inside a module. Useful for "what does this module own?" */
+  listModuleTopSymbols(moduleId: number, limit = 20): SymbolRow[] {
+    if (!this.hasModuleTables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN module_members mm ON mm.file_id = s.file_id
+        WHERE mm.module_id = ? AND s.is_rankable = 1
+        ORDER BY s.pagerank DESC
+        LIMIT ?
+      `).all(moduleId, limit) as Row[];
+      return rows.map(toSymbolRow);
+    } catch { return []; }
+  }
+
+  /** Module containing a file id, or null when the file has no membership row. */
+  moduleForFile(fileId: number): { id: number; label: string } | null {
+    if (!this.hasModuleTables) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT m.id, m.label
+        FROM module_members mm JOIN modules m ON m.id = mm.module_id
+        WHERE mm.file_id = ?
+      `).get(fileId) as Row | undefined;
+      if (!row) return null;
+      return { id: toNum(row.id), label: toStr(row.label) };
+    } catch { return null; }
+  }
+
+  /**
+   * Cross-module dependency edges. Direction is configurable:
+   *   - 'out' (default) → modules this one depends on (from = moduleId)
+   *   - 'in'            → modules that depend on this one (to = moduleId)
+   * Aggregates across all edge kinds; the kind is preserved per row.
+   */
+  moduleDependencies(
+    moduleId: number,
+    options: { direction?: 'in' | 'out'; limit?: number } = {},
+  ): Array<{
+    moduleId: number; label: string; kind: string; weight: number;
+  }> {
+    if (!this.hasModuleTables) return [];
+    const direction = options.direction ?? 'out';
+    const limit = options.limit ?? 100;
+    const sideThis = direction === 'out' ? 'from_module_id' : 'to_module_id';
+    const sideOther = direction === 'out' ? 'to_module_id' : 'from_module_id';
+    try {
+      const rows = this.db.prepare(`
+        SELECT m.id AS moduleId, m.label, me.kind, me.weight
+        FROM module_edges me JOIN modules m ON m.id = me.${sideOther}
+        WHERE me.${sideThis} = ?
+        ORDER BY me.weight DESC
+        LIMIT ?
+      `).all(moduleId, limit) as Row[];
+      return rows.map(r => ({
+        moduleId: toNum(r.moduleId),
+        label: toStr(r.label),
+        kind: toStr(r.kind),
+        weight: toNum(r.weight),
+      }));
+    } catch { return []; }
+  }
+
+  // ── Track-E: behavioral / risk helpers ──────────────────────────────────────
+
+  /**
+   * Raw 'tests' edges into a specific symbol id — id-scoped so short-name
+   * siblings (`Alpha.run` / `Beta.run`) don't share a behavioral contract.
+   * Returns the test-side caller info (name, file, line) so the ranker can
+   * compute path-convention and naming-convention signals without
+   * re-fetching.
+   *
+   * The id-based filter is correct because `synthesizeTestEdges()` now
+   * preserves the source call edge's resolved `to_id` verbatim instead of
+   * re-resolving via `WHERE name = edges.to_name LIMIT 1` (which collapsed
+   * same-short-name symbols).
+   */
+  directTestEdgesForId(symbolId: number, limit = 200): Array<{
+    callerId: number; callerName: string; callerQualifiedName: string | null;
+    callerKind: string; callerFile: string; callerLineStart: number; callerLineEnd: number;
+    edgeLine: number; assertionCount: number;
+  }> {
+    if (!this.hasV4Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT
+          s.id           AS callerId,
+          s.name         AS callerName,
+          s.qualified_name AS callerQualifiedName,
+          s.kind         AS callerKind,
+          f.path         AS callerFile,
+          s.line_start   AS callerLineStart,
+          s.line_end     AS callerLineEnd,
+          e.line         AS edgeLine
+        FROM edges e
+        JOIN symbols s ON s.id = e.from_id
+        JOIN files f ON f.id = s.file_id
+        WHERE e.to_id = ? AND e.kind = 'tests'
+        ORDER BY f.path, e.line
+        LIMIT ?
+      `).all(symbolId, limit) as Row[];
+      return rows.map(r => ({
+        callerId: toNum(r.callerId),
+        callerName: toStr(r.callerName),
+        callerQualifiedName: toNullStr(r.callerQualifiedName),
+        callerKind: toStr(r.callerKind),
+        callerFile: toStr(r.callerFile),
+        callerLineStart: toNum(r.callerLineStart),
+        callerLineEnd: toNum(r.callerLineEnd),
+        edgeLine: toNum(r.edgeLine),
+        // Computed in JS — needs the file contents.
+        assertionCount: 0,
+      }));
+    } catch { return []; }
+  }
+
+  /**
+   * Count how many distinct routes have this symbol as their resolved handler.
+   * Used by seer_risk for the "route exposure" signal.
+   */
+  routesForHandler(symbolId: number): Array<{ method: string; path: string; framework: string }> {
+    if (!this.hasV4Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT method, path, framework
+        FROM routes WHERE handler_id = ?
+      `).all(symbolId) as Row[];
+      return rows.map(r => ({
+        method: toStr(r.method), path: toStr(r.path), framework: toStr(r.framework),
+      }));
+    } catch { return []; }
+  }
+
+  /** Distinct config keys read inside a symbol's body. */
+  configKeysForSymbol(symbolId: number): Array<{ key: string; source: string; line: number }> {
+    if (!this.hasV4Tables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT DISTINCT key, source, line
+        FROM config_keys WHERE symbol_id = ?
+        ORDER BY line
+      `).all(symbolId) as Row[];
+      return rows.map(r => ({
+        key: toStr(r.key), source: toStr(r.source), line: toNum(r.line),
+      }));
+    } catch { return []; }
+  }
+
+  /**
+   * For each call edge OUT of a symbol, return the callee's module id (when
+   * resolved). Used by seer_risk for the "module-boundary crossing" signal.
+   * NULL module ids are filtered out — those are external/unresolved calls.
+   */
+  calleeModulesOf(symbolId: number): Array<{ calleeId: number; moduleId: number }> {
+    if (!this.hasModuleTables) return [];
+    try {
+      const rows = this.db.prepare(`
+        SELECT DISTINCT e.to_id AS calleeId, mm.module_id AS moduleId
+        FROM edges e
+        JOIN symbols s ON s.id = e.to_id
+        JOIN module_members mm ON mm.file_id = s.file_id
+        WHERE e.from_id = ? AND e.kind = 'call' AND e.to_id IS NOT NULL
+      `).all(symbolId) as Row[];
+      return rows.map(r => ({
+        calleeId: toNum(r.calleeId), moduleId: toNum(r.moduleId),
+      }));
+    } catch { return []; }
+  }
+
+  /**
    * For each file id, return the symbols that match the given line ranges.
    * Used by `detect_changes` to compute the blast radius of a diff.
    */
@@ -1665,6 +3769,324 @@ export class Store {
     return rows.map(toSymbolRow);
   }
 
+  // ── Track-F: SCIP imports tracking ──────────────────────────────────────────
+
+  /**
+   * Record (or refresh) a SCIP import. Returns the row id. UNIQUE on
+   * (path, sha256) — if the same file with the same content is re-imported,
+   * the existing row is kept (the caller's idempotency guarantee).
+   */
+  recordScipImport(
+    scipPath: string, sha256: string, tool: string | null,
+    projectRoot: string | null, symbolCount: number, refCount: number,
+  ): number {
+    if (!this.hasV7Columns) return 0;
+    const existing = this.db.prepare(
+      'SELECT id FROM scip_imports WHERE path = ? AND sha256 = ?',
+    ).get(scipPath, sha256) as Row | undefined;
+    if (existing) {
+      this.db.prepare(
+        'UPDATE scip_imports SET imported_at = ?, tool = ?, project_root = ?, symbol_count = ?, ref_count = ? WHERE id = ?',
+      ).run(Date.now(), tool, projectRoot, symbolCount, refCount, toNum(existing.id));
+      return toNum(existing.id);
+    }
+    const res = this.db.prepare(
+      'INSERT INTO scip_imports (path, sha256, tool, project_root, imported_at, symbol_count, ref_count) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run(scipPath, sha256, tool, projectRoot, Date.now(), symbolCount, refCount);
+    return toNum(res.lastInsertRowid);
+  }
+
+  /**
+   * Has this exact SCIP file (by sha) been imported already? Lets callers
+   * short-circuit a re-parse on no-op CI re-runs.
+   */
+  hasScipImport(scipPath: string, sha256: string): boolean {
+    if (!this.hasV7Columns) return false;
+    const row = this.db.prepare(
+      'SELECT 1 FROM scip_imports WHERE path = ? AND sha256 = ?',
+    ).get(scipPath, sha256) as Row | undefined;
+    return row != null;
+  }
+
+  /** Listing for `seer_scip_imports` / the bundle manifest. */
+  listScipImports(): Array<{
+    id: number; path: string; sha256: string; tool: string | null;
+    projectRoot: string | null; importedAt: number;
+    symbolCount: number; refCount: number;
+  }> {
+    if (!this.hasV7Columns) return [];
+    const rows = this.db.prepare(`
+      SELECT id, path, sha256, tool, project_root AS projectRoot,
+             imported_at AS importedAt, symbol_count AS symbolCount, ref_count AS refCount
+      FROM scip_imports ORDER BY imported_at DESC
+    `).all() as Row[];
+    return rows.map(r => ({
+      id: toNum(r.id), path: toStr(r.path), sha256: toStr(r.sha256),
+      tool: toNullStr(r.tool), projectRoot: toNullStr(r.projectRoot),
+      importedAt: toNum(r.importedAt),
+      symbolCount: toNum(r.symbolCount), refCount: toNum(r.refCount),
+    }));
+  }
+
+  /**
+   * Insert (or upsert) a SCIP-sourced symbol. Returns the row id. Uses
+   * (file_id, qualified_name, line_start, kind) as the dedup key when the
+   * existing row was also SCIP-sourced — we never delete tree-sitter rows.
+   * Tree-sitter rows with the same identifier and overlapping line range are
+   * marked 'scip-merge' (precision confirmed by SCIP) instead of being
+   * duplicated, so the agent-facing default lens stays compact.
+   *
+   * `scipImportId` is the `scip_imports.id` row this symbol came from — it
+   * gets persisted on both fresh inserts and merge updates so a later
+   * `clearScipProvenance(path)` can scope its wipe to a single layer instead
+   * of nuking every SCIP row in the DB.
+   */
+  insertOrMergeScipSymbol(
+    fileId: number, def: SymbolDef, scipImportId: number,
+  ): { id: number; merged: boolean } {
+    if (!this.hasV7Columns) {
+      const id = this.insertSymbol(fileId, def);
+      return { id, merged: false };
+    }
+    const qualified = def.qualifiedName ?? def.name;
+    // Look for a tree-sitter row with the same qualified name and overlapping
+    // line range — that's the "SCIP confirms our row" case.
+    const existing = this.db.prepare(`
+      SELECT id, provenance FROM symbols
+      WHERE file_id = ?
+        AND (qualified_name = ? OR name = ?)
+        AND kind = ?
+        AND line_start <= ?
+        AND line_end >= ?
+    `).get(
+      fileId, qualified, def.name, def.kind,
+      def.lineEnd, def.lineStart,
+    ) as Row | undefined;
+
+    if (existing) {
+      const existingId = toNum(existing.id);
+      const prov = toStr(existing.provenance);
+      // tree-sitter rows get re-labeled scip-merge AND linked to the import
+      // id, so clearScipProvenance(path) can demote them back. Pre-existing
+      // scip-merge / scip rows keep their original import id so two different
+      // SCIP layers confirming the same tree-sitter row don't fight over it.
+      if (prov === 'tree-sitter') {
+        this.db.prepare("UPDATE symbols SET provenance = 'scip-merge', scip_import_id = ? WHERE id = ?")
+          .run(scipImportId, existingId);
+      }
+      // Stay using the existing id — SCIP-sourced references can point at it.
+      return { id: existingId, merged: true };
+    }
+
+    // No overlap → insert a fresh SCIP-provenance row.
+    const sig = def.signature ? def.signature.slice(0, 240) : null;
+    const symbolKey = makeSymbolKey(def.kind, qualified);
+    const res = this.db.prepare(`
+      INSERT INTO symbols
+        (name, qualified_name, kind, file_id, line_start, line_end, col_start, col_end,
+         signature, is_rankable, loc, cyclomatic, cognitive, max_nesting, symbol_key, symbol_role, provenance, shape_hash, scip_import_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scip', NULL, ?)
+    `).run(
+      def.name, qualified, def.kind, fileId,
+      def.lineStart, def.lineEnd,
+      def.colStart, def.colEnd,
+      sig,
+      (isRankableKind(def.kind) ? 1 : 0),
+      def.loc ?? null, def.cyclomatic ?? null,
+      def.cognitive ?? null, def.maxNesting ?? null,
+      symbolKey, 'definition',
+      scipImportId,
+    );
+    return { id: toNum(res.lastInsertRowid), merged: false };
+  }
+
+  /**
+   * Insert a SCIP-sourced reference edge. `to_id` is set immediately because
+   * SCIP gives us precise targets — no need for the same-file/imported/global
+   * fallback resolver used for tree-sitter call edges.
+   *
+   * `scipImportId` ties the edge to the contributing SCIP layer so per-layer
+   * wipes are clean.
+   */
+  insertScipEdge(
+    fromSymbolId: number, toSymbolId: number, toName: string, kind: string,
+    line: number, scipImportId: number,
+  ): void {
+    if (!this.hasV7Columns) return;
+    this.db.prepare(
+      "INSERT INTO edges (from_id, to_name, to_id, kind, line, provenance, scip_import_id) VALUES (?, ?, ?, ?, ?, 'scip', ?)",
+    ).run(fromSymbolId, toName, toSymbolId, kind, line, scipImportId);
+  }
+
+  /**
+   * Wipe SCIP-sourced rows so a fresh import can replace them. Tree-sitter
+   * rows are preserved; only the rows that came from the specified SCIP layer
+   * are touched.
+   *
+   *   - scipPath omitted → ALL SCIP layers are wiped (every scip-provenance
+   *     row is dropped, every scip-merge row demoted to tree-sitter, and
+   *     the scip_imports table emptied). Useful for "I want my baseline
+   *     back."
+   *   - scipPath provided → only rows linked to scip_imports.id for that
+   *     path are touched. Sibling layers stay intact. This is what
+   *     importScip() calls before re-ingesting the same path, so a
+   *     multi-layer setup (rust+ts SCIPs) stays correct on partial refresh.
+   */
+  clearScipProvenance(scipPath?: string): number {
+    if (!this.hasV7Columns) return 0;
+    let edgeDeletes = 0, symDeletes = 0;
+    this.db.exec('BEGIN');
+    try {
+      if (scipPath == null) {
+        // Global wipe — every SCIP layer collapses.
+        this.db.exec("UPDATE symbols SET provenance = 'tree-sitter', scip_import_id = NULL WHERE provenance = 'scip-merge'");
+        const eRes = this.db.prepare("DELETE FROM edges WHERE provenance = 'scip'").run();
+        edgeDeletes = toNum(eRes.changes);
+        const sRes = this.db.prepare("DELETE FROM symbols WHERE provenance = 'scip'").run();
+        symDeletes = toNum(sRes.changes);
+        this.db.exec('DELETE FROM scip_imports');
+      } else {
+        // Per-layer wipe — look up the import id for this path. If there's
+        // no row, treat it as "nothing to do" rather than failing (callers
+        // can blindly call clearScipProvenance(path) before insertion).
+        const rows = this.db.prepare(
+          'SELECT id FROM scip_imports WHERE path = ?',
+        ).all(scipPath) as Row[];
+        const ids = rows.map(r => toNum(r.id));
+        if (ids.length > 0) {
+          const ph = ids.map(() => '?').join(',');
+          this.db.prepare(
+            `UPDATE symbols SET provenance = 'tree-sitter', scip_import_id = NULL
+             WHERE provenance = 'scip-merge' AND scip_import_id IN (${ph})`,
+          ).run(...ids);
+          const eRes = this.db.prepare(
+            `DELETE FROM edges WHERE provenance = 'scip' AND scip_import_id IN (${ph})`,
+          ).run(...ids);
+          edgeDeletes = toNum(eRes.changes);
+          const sRes = this.db.prepare(
+            `DELETE FROM symbols WHERE provenance = 'scip' AND scip_import_id IN (${ph})`,
+          ).run(...ids);
+          symDeletes = toNum(sRes.changes);
+          this.db.prepare('DELETE FROM scip_imports WHERE path = ?').run(scipPath);
+        }
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return symDeletes + edgeDeletes;
+  }
+
+  /** Provenance breakdown for `seer_health` / `seer_stats`. */
+  getProvenanceCounts(): { symbols: Record<string, number>; edges: Record<string, number> } {
+    const out = {
+      symbols: { 'tree-sitter': 0, scip: 0, 'scip-merge': 0 } as Record<string, number>,
+      edges:   { 'tree-sitter': 0, scip: 0, 'scip-merge': 0 } as Record<string, number>,
+    };
+    if (!this.hasV7Columns) return out;
+    try {
+      for (const r of this.db.prepare('SELECT provenance, COUNT(*) AS c FROM symbols GROUP BY provenance').all() as Row[]) {
+        out.symbols[toStr(r.provenance)] = toNum(r.c);
+      }
+      for (const r of this.db.prepare('SELECT provenance, COUNT(*) AS c FROM edges GROUP BY provenance').all() as Row[]) {
+        out.edges[toStr(r.provenance)] = toNum(r.c);
+      }
+    } catch { /* */ }
+    return out;
+  }
+
+  // ── Track-F: shape-hash (structural SimHash) ────────────────────────────────
+
+  /** Set a symbol's shape_hash. NULL clears it. Persisted as INTEGER. */
+  setShapeHash(symbolId: number, hash: bigint | null): void {
+    if (!this.hasV7Columns) return;
+    // node:sqlite accepts bigint for INTEGER columns; convert to signed range.
+    const value = hash == null ? null : toSignedI64(hash);
+    this.db.prepare('UPDATE symbols SET shape_hash = ? WHERE id = ?').run(value, symbolId);
+  }
+
+  /**
+   * Fetch all symbols that have a non-null shape_hash. Used as the candidate
+   * pool for duplicate detection. Returns minimal fields to keep the working
+   * set small on huge codebases.
+   */
+  listSymbolsWithShapeHash(opts: {
+    minLoc?: number; includeTests?: boolean; limit?: number;
+  } = {}): Array<{
+    id: number; name: string; qualifiedName: string | null; kind: string;
+    filePath: string; lineStart: number; lineEnd: number;
+    loc: number | null; shapeHash: bigint;
+  }> {
+    if (!this.hasV7Columns) return [];
+    const conds: string[] = ['s.shape_hash IS NOT NULL'];
+    const args: Array<string | number> = [];
+    if (opts.minLoc != null) {
+      conds.push('s.loc >= ?');
+      args.push(opts.minLoc);
+    }
+    if (opts.includeTests === false) {
+      conds.push("f.role <> 'test'");
+    }
+    const limit = opts.limit ?? 50000;
+    args.push(limit);
+    const stmt = this.db.prepare(`
+      SELECT s.id, s.name, s.qualified_name AS qualifiedName, s.kind,
+             f.path AS filePath, s.line_start AS lineStart, s.line_end AS lineEnd,
+             s.loc, s.shape_hash AS shapeHash
+      FROM symbols s JOIN files f ON f.id = s.file_id
+      WHERE ${conds.join(' AND ')}
+      ORDER BY s.id
+      LIMIT ?
+    `);
+    // shape_hash regularly overflows JS safe-integer range; without this flag
+    // node:sqlite throws on row materialization, which the outer try-catch
+    // would swallow into an empty result. We opt the entire row into bigint
+    // and convert the small-int columns back to plain numbers.
+    try { stmt.setReadBigInts(true); } catch { /* */ }
+    try {
+      const rows = stmt.all(...args) as Row[];
+      return rows.map(r => ({
+        id: toNum(r.id),
+        name: toStr(r.name),
+        qualifiedName: toNullStr(r.qualifiedName),
+        kind: toStr(r.kind),
+        filePath: toStr(r.filePath),
+        lineStart: toNum(r.lineStart),
+        lineEnd: toNum(r.lineEnd),
+        loc: toNullNum(r.loc),
+        shapeHash: toUnsignedI64(r.shapeHash),
+      }));
+    } catch { return []; }
+  }
+
+  /** v7 read-flag accessor for downstream features that need to gate on it. */
+  hasV7(): boolean { return this.hasV7Columns; }
+
+  /**
+   * Are there function-like symbols (kind function/method/constructor, role
+   * not 'declaration', loc >= 4) that don't yet have a shape_hash? Used by
+   * the indexer to decide whether to run buildShapeHashes() on a cached
+   * re-run — when a pre-v7 DB migrates to v7, every existing row still has
+   * shape_hash NULL even though the file is "cached" (its content hash
+   * didn't change), so the normal graphChanged predicate misses the
+   * backfill. This check catches that.
+   */
+  hasMissingShapeHashes(minLoc = 4): boolean {
+    if (!this.hasV7Columns) return false;
+    try {
+      const row = this.db.prepare(`
+        SELECT 1 FROM symbols
+        WHERE shape_hash IS NULL
+          AND kind IN ('function','method','constructor')
+          AND symbol_role <> 'declaration'
+          AND loc >= ?
+        LIMIT 1
+      `).get(minLoc) as Row | undefined;
+      return row != null;
+    } catch { return false; }
+  }
+
   // ── Stats ───────────────────────────────────────────────────────────────────
 
   getStats(): StatsRow {
@@ -1681,7 +4103,7 @@ export class Store {
     const languages: Record<string, number> = {};
     for (const r of langRows) languages[toStr(r.language)] = toNum(r.c);
 
-    let routes = 0, externalDependencies = 0, configKeys = 0, symbolHistory = 0;
+    let routes = 0, externalDependencies = 0, configKeys = 0, symbolHistory = 0, modules = 0;
     try { routes = this.countRoutes(); } catch { /* */ }
     try { externalDependencies = this.countExternalDeps(); } catch { /* */ }
     try { configKeys = this.countConfigKeys(); } catch { /* */ }
@@ -1690,6 +4112,25 @@ export class Store {
         symbolHistory = toNum((this.db.prepare('SELECT COUNT(*) AS c FROM symbol_history').get() as Row).c);
       }
     } catch { /* */ }
+    try { modules = this.countModules(); } catch { /* */ }
+
+    // v7 extras — provenance breakdown and SCIP imports + shape_hash coverage.
+    let scipImports = 0;
+    let shapeHashed = 0;
+    if (this.hasV7Columns) {
+      try {
+        scipImports = toNum((this.db.prepare('SELECT COUNT(*) AS c FROM scip_imports').get() as Row).c);
+      } catch { /* */ }
+      try {
+        shapeHashed = toNum((this.db.prepare('SELECT COUNT(*) AS c FROM symbols WHERE shape_hash IS NOT NULL').get() as Row).c);
+      } catch { /* */ }
+    }
+
+    // v8 Track G — service-link counts.
+    let serviceCalls = 0;
+    let serviceLinks = 0;
+    try { serviceCalls = this.countServiceCalls(); } catch { /* */ }
+    try { serviceLinks = this.countServiceLinks(); } catch { /* */ }
 
     return {
       files, symbols, edges, resolvedEdges, languages,
@@ -1698,6 +4139,12 @@ export class Store {
       externalDependencies,
       configKeys,
       symbolHistory,
+      modules,
+      scipImports,
+      shapeHashed,
+      provenance: this.getProvenanceCounts(),
+      serviceCalls,
+      serviceLinks,
     };
   }
 
