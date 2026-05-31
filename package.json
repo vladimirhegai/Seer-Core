@@ -1,7 +1,7 @@
 {
   "name": "seer-mcp",
-  "version": "0.1.0",
-  "description": "Local-first AI codebase explainer — onboarding from months to days",
+  "version": "0.1.1",
+  "description": "Give your AI agents a map of your repo before they edit.",
   "private": false,
   "type": "commonjs",
   "bin": {
