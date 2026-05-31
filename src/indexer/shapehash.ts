@@ -147,14 +147,7 @@ export function computeShapeHash(body: string, minTokens = 8): bigint | null {
     ngram.push(tok.kind === 'OP' ? `OP:${tok.text}` : tok.kind);
     if (ngram.length < NGRAM_SIZE) continue;
     if (ngram.length > NGRAM_SIZE) ngram.shift();
-    const h = fnv64(ngram.join('|'));
-    // Split the 64-bit hash into two 32-bit halves ONCE, then walk the bits
-    // with plain 32-bit number ops. The previous version did 64 BigInt shifts
-    // per n-gram; BigInt is an order of magnitude slower than number math and
-    // this loop is the hot path. The produced bits are identical, so stored
-    // hashes and duplicate clustering are unchanged.
-    const lo = Number(h & 0xFFFFFFFFn);
-    const hi = Number((h >> 32n) & 0xFFFFFFFFn);
+    const [lo, hi] = fnv64(ngram.join('|'));
     for (let b = 0; b < 32; b++) counters[b] += ((lo >>> b) & 1) ? 1 : -1;
     for (let b = 0; b < 32; b++) counters[b + 32] += ((hi >>> b) & 1) ? 1 : -1;
   }
@@ -165,16 +158,34 @@ export function computeShapeHash(body: string, minTokens = 8): bigint | null {
   return out;
 }
 
-/** FNV-1a 64-bit hash. Stable, deterministic, no dependencies. */
-function fnv64(s: string): bigint {
-  let h = 0xcbf29ce484222325n;
-  const PRIME = 0x100000001b3n;
-  const MASK = 0xFFFFFFFFFFFFFFFFn;
+/**
+ * FNV-1a 64-bit hash, returned as [lo, hi] unsigned 32-bit Numbers.
+ *
+ * Produces IDENTICAL bit patterns to the BigInt version — existing stored
+ * shape_hash values remain valid. The speedup is from replacing BigInt
+ * multiplication with Number arithmetic.
+ *
+ * FNV prime = 0x100000001b3 = 256 * 2^32 + 435, so:
+ *   new_lo = (lo * 435) mod 2^32
+ *   new_hi = (hi * 435 + lo * 256 + floor(lo * 435 / 2^32)) mod 2^32
+ *
+ * All intermediates fit in float64 exact-integer range (< 2^53):
+ *   lo * 435 < 2^32 * 435 < 2^41  ✓
+ *   hi * 435 + lo * 256 + carry < 2^41 + 2^41 + 434 < 2^42  ✓
+ */
+function fnv64(s: string): [number, number] {
+  let lo = 0x84222325;  // low  32 bits of FNV-1a 64-bit offset basis
+  let hi = 0xcbf29ce4;  // high 32 bits
   for (let i = 0; i < s.length; i++) {
-    h ^= BigInt(s.charCodeAt(i) & 0xff);
-    h = (h * PRIME) & MASK;
+    lo = (lo ^ (s.charCodeAt(i) & 0xff)) >>> 0;  // XOR → unsigned 32-bit
+    const prod  = lo * 435;                        // exact float < 2^41
+    const nlo   = prod >>> 0;                      // low 32 bits
+    const carry = (prod - nlo) / 4294967296;       // exact integer [0, 434]
+    // hi term: hi*435 (PRIME_LO) + lo*256 (PRIME_HI * lo_contribution) + carry
+    hi = (Math.imul(hi, 435) + Math.imul(lo, 256) + carry) >>> 0;
+    lo = nlo;
   }
-  return h;
+  return [lo, hi];
 }
 
 /** Hamming distance between two 64-bit bigints. */

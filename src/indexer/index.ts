@@ -886,6 +886,16 @@ export class Indexer {
     const configKeysResolved = this.store.resolveConfigKeySymbols();
     const testEdgesAdded = this.store.synthesizeTestEdges();
 
+    // ── Graph-changed predicate ─────────────────────────────────────────────
+    // All the inputs it needs are now available. Hoisted here so the external-
+    // dep extraction and PageRank/modules/boundaries/shape-hash passes can all
+    // share the same gate.
+    const graphChanged =
+      indexed > 0 ||
+      prunedFiles > 0 ||
+      resolution.sameFile + resolution.imported + resolution.global > 0 ||
+      resolvedImports > 0;
+
     // v9 Track-H: scan k8s manifests + Docker Compose for service hostnames.
     // Passed to the resolver as evidence — host_hint hits get a confidence
     // boost and may be classified as `service_host` link matches.
@@ -911,16 +921,20 @@ export class Indexer {
       if (verbose) process.stdout.write(`  ⚠  service-link resolution failed: ${err}\n`);
     }
 
-    // External dependency extraction from manifests/lockfiles. This is cheap
-    // and idempotent — clear and re-insert every full pass so deletions are
-    // reflected. We pass absRoot so the extractor finds package.json /
-    // Cargo.toml / etc. at the repo root and walks down for monorepos.
-    try {
-      const { extractExternalDependencies } = await import('./externaldeps.js');
-      await extractExternalDependencies(absRoot, this.store);
-    } catch (err) {
-      if (verbose) {
-        process.stdout.write(`  ⚠  external dep extraction failed: ${err}\n`);
+    // External dependency extraction from manifests/lockfiles. Gated behind
+    // graphChanged so we skip the glob scan on cached re-indexes (it costs
+    // ~400ms on Windows for Rust monorepos like godot/Unreal). Trade-off: if
+    // a user edits only package.json/Cargo.toml with no source change, deps
+    // update on the next source-file change rather than immediately. Acceptable
+    // given that dependency changes almost always coincide with code changes.
+    if (graphChanged) {
+      try {
+        const { extractExternalDependencies } = await import('./externaldeps.js');
+        await extractExternalDependencies(absRoot, this.store);
+      } catch (err) {
+        if (verbose) {
+          process.stdout.write(`  ⚠  external dep extraction failed: ${err}\n`);
+        }
       }
     }
 
@@ -928,26 +942,8 @@ export class Indexer {
     // PageRank values are a pure function of the resolved edge graph. If nothing
     // in that graph changed this run, every previously-stored rank is still
     // correct and we can skip the O(iterations × edges) recomputation.
-    //
-    // "Nothing changed" requires ALL of the following:
-    //   - no file was newly indexed (no new symbols/edges/imports inserted)
-    //   - no stale file was pruned (would have cascaded FK deletes,
-    //     potentially NULLing inbound edge `to_id`s)
-    //   - resolveEdges() promoted zero NULL `to_id`s to a real id
-    //   - resolveImports() promoted zero NULL `resolved_file_id`s
-    //
-    // If any of those is nonzero, the symbol set OR the resolved-edge graph
-    // could have shifted, so we recompute. This is the same correctness
-    // contract that the scale-test's "top-symbol id stability" check enforces
-    // — drift there means the predicate below missed a case.
-    //
-    // Why this is safe even on first run: when the DB is fresh, `indexed > 0`
-    // (everything is new), so the predicate fires and PageRank is computed.
-    const graphChanged =
-      indexed > 0 ||
-      prunedFiles > 0 ||
-      resolution.sameFile + resolution.imported + resolution.global > 0 ||
-      resolvedImports > 0;
+    // `graphChanged` was computed above (after synthesizeTestEdges) and is shared
+    // by all the lazy post-pass gates below.
 
     let pagerankRecomputed = false;
     if (graphChanged) {

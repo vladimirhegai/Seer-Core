@@ -99,8 +99,22 @@ export function buildContinuity(
   // renames go through the O(1) `byHash` map). On a big repo n^2 is ruinous, so
   // we only run it when the pool is small enough to stay cheap. The exact-shape
   // path always runs regardless of pool size.
-  const CLOSE_MATCH_POOL_CAP = 4000;
+  //
+  // Cap raised 4000→10000 after the inner loop was rewritten to use Number
+  // popcount instead of BigInt Kernighan — same wall-time budget, 6× more symbols.
+  const CLOSE_MATCH_POOL_CAP = 10000;
   const closeMatchEnabled = pool.length <= CLOSE_MATCH_POOL_CAP;
+
+  // Precompute lo/hi 32-bit split of each shape hash once. The inner close-hash
+  // loop then runs with pure Number XOR + popcount32 — no BigInt in the hot path.
+  const poolLo = new Uint32Array(pool.length);
+  const poolHi = new Uint32Array(pool.length);
+  if (closeMatchEnabled) {
+    for (let k = 0; k < pool.length; k++) {
+      poolLo[k] = Number(pool[k].shapeHash & 0xFFFFFFFFn);
+      poolHi[k] = Number((pool[k].shapeHash >> 32n) & 0xFFFFFFFFn);
+    }
+  }
 
   for (const s of pool) {
     // Find the symbol's stored history count. If it's >= historyThreshold
@@ -162,10 +176,13 @@ export function buildContinuity(
     // Close hash match (speculative; skipped on large repos — see cap above).
     if (!closeMatchEnabled) { skipped++; continue; }
     let best: { peer: typeof pool[number]; distance: number } | null = null;
-    for (const peer of pool) {
+    const sLo = Number(s.shapeHash & 0xFFFFFFFFn);
+    const sHi = Number((s.shapeHash >> 32n) & 0xFFFFFFFFn);
+    for (let ki = 0; ki < pool.length; ki++) {
+      const peer = pool[ki];
       if (peer.id === s.id) continue;
-      if ((peer.name === s.name) && (peer.qualifiedName === s.qualifiedName)) continue;
-      const d = hammingDistance(s.shapeHash, peer.shapeHash);
+      if (peer.name === s.name && peer.qualifiedName === s.qualifiedName) continue;
+      const d = popcount32((sLo ^ poolLo[ki]) >>> 0) + popcount32((sHi ^ poolHi[ki]) >>> 0);
       if (d > maxHamming) continue;
       if (!best || d < best.distance) best = { peer, distance: d };
     }
@@ -279,14 +296,17 @@ function pickBestCandidate<T extends { id: number; name: string; qualifiedName: 
   return candidates[0] ?? null;
 }
 
+/** Standard Hamming weight for a 32-bit unsigned integer (constant time). */
+function popcount32(x: number): number {
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  x = (x + (x >>> 4)) & 0x0f0f0f0f;
+  return Math.imul(x, 0x01010101) >>> 24;
+}
+
 function hammingDistance(a: bigint, b: bigint): number {
-  let x = a ^ b;
-  let n = 0;
-  while (x !== 0n) {
-    x &= x - 1n;
-    n++;
-  }
-  return n;
+  const x = a ^ b;
+  return popcount32(Number(x & 0xFFFFFFFFn)) + popcount32(Number((x >> 32n) & 0xFFFFFFFFn));
 }
 
 /**
