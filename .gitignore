@@ -40,9 +40,10 @@ Thumbs.db
 Large Codebases/
 LargeCodebases/
 
-#seer-master-guide.md
+seer-master-guide.md
 STRESS_TEST_REPORT.md
-#seer-cli-docs.md
+seer-cli-docs.md
 research-papers.md
 adding-new-languages.md
+README_dev.md
 

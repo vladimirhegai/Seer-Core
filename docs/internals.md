@@ -10,7 +10,7 @@ caching, edge resolution, worker pooling, and the database schema.
 
 | Piece | Choice | Why |
 |---|---|---|
-| Runtime | Node.js 18+ (26+ recommended) | Standard worker threads, fast local startup. |
+| Runtime | Node.js 24+ | Built-in `node:sqlite` (unflagged on 24+), worker threads, fast startup. |
 | Language | TypeScript, CommonJS output | Type safety for graph code; CommonJS maps cleanly to Node tooling. |
 | Database | built-in `node:sqlite` | Zero native npm dependencies; no compiler traps. |
 | Parser | `web-tree-sitter` (WASM) | Tree-sitter parsing in V8 with no native C++ build. |

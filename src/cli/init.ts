@@ -82,21 +82,29 @@ function resolveLaunch(workspace: string, opts: InitOptions): LaunchSpec {
     return { command: parts[0], args: parts.slice(1) };
   }
 
-  if (opts.npx) {
-    const args = ['-y', opts.pkg || DEFAULT_PKG, 'mcp'];
-    if (opts.db) args.push('--db', opts.db);
-    return { command: 'npx', args };
-  }
-
-  // Default: an absolute path to the compiled CLI entry. __dirname is
-  // dist/cli when built; map a src/.ts path back to dist/.js so the snippet we
-  // emit always points at the thing agents can actually run.
+  // The compiled CLI entry. __dirname is dist/cli when built; map a src/.ts
+  // path back to dist/.js so the snippet we emit always points at the thing
+  // agents can actually run.
   let entry = path.join(__dirname, 'index.js');
   if (entry.includes(`${path.sep}src${path.sep}`) || entry.endsWith('.ts')) {
     entry = entry
       .replace(`${path.sep}src${path.sep}`, `${path.sep}dist${path.sep}`)
       .replace(/\.ts$/, '.js');
   }
+
+  // When Seer is running from an npm install (global, local, or `npx`), the
+  // entry lives inside a node_modules tree whose path is unstable across
+  // machines and cache evictions. In that case the portable `npx` launcher is
+  // the right default, which is what makes `npx seer-mcp init` produce
+  // zero-tinkering, shareable config. From a source checkout we keep the
+  // absolute node path so it works without publishing.
+  const installed = entry.includes(`${path.sep}node_modules${path.sep}`);
+  if (opts.npx || installed) {
+    const args = ['-y', opts.pkg || DEFAULT_PKG, 'mcp'];
+    if (opts.db) args.push('--db', opts.db);
+    return { command: 'npx', args };
+  }
+
   const args = [entry, 'mcp', '--workspace', workspace];
   if (opts.db) args.push('--db', opts.db);
   return { command: 'node', args };

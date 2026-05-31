@@ -13,26 +13,37 @@ warm (cached); the cached pass must reproduce the fresh pass's counts exactly,
 so these timings come from runs that also prove determinism.
 
 - Node: v26.1.0
-- Platform: win32
+- Platform: win32 (consumer laptop)
 - Codebase-Memory is excluded from the benchmark set on purpose (it is a
   self-validation fixture, not a public comparison repo).
 
+These are from a single `npm run scale-test` session, so the rows are directly
+comparable. Absolute wall-clock time depends on your CPU and disk; the shape
+(near-linear ms/file, large cache speedup) is what carries across machines.
+Rerun on your own hardware with the command at the bottom.
+
 <!-- speed-table-begin -->
-| Codebase | Language(s) | Files | Symbols | Edges | Resolved | Fresh index | ms/file | Cached re-index | Cache speedup | DB size |
+| Codebase | Language(s) | Files | Symbols | Edges | Resolved | Index time | ms/file | Cached re-index | Cache speedup | DB size |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| helix | Rust | (pending) | | | | | | | | |
-| client-go | Go | (pending) | | | | | | | | |
-| react | TS/JS | (pending) | | | | | | | | |
-| godot | C++/C#/Java | (pending) | | | | | | | | |
-| TypeScript | TS | (pending) | | | | | | | | |
-| linux | C/C++ | (pending) | | | | | | | | |
-| Unreal Engine | C++ | (pending) | | | | | | | | |
+| helix | Rust | 245 | 5,207 | 24,057 | 64.5% | 1.4s | 5.8 | 0.6s | 2.3x | 5 MB |
+| client-go | Go | 2,314 | 17,589 | 41,714 | 67.9% | 2.2s | 0.9 | 0.6s | 3.9x | 15 MB |
+| react | TS/JS | 4,359 | 20,624 | 48,387 | 69.9% | 6.9s | 1.6 | 2.2s | 3.1x | 17 MB |
+| godot | C++/C#/Java | 4,228 | 134,792 | 541,981 | 80.7% | 22.9s | 5.4 | 1.5s | 15.3x | 136 MB |
+| TypeScript | TS | 39,331 | 133,691 | 118,389 | 91.6% | 40.1s | 1.0 | 4.1s | 9.8x | 85 MB |
+| linux | C/C++ | 63,965 | 1,050,833 | 4,380,287 | 71.4% | 3m46s | 3.5 | 16.3s | 13.9x | 1,095 MB |
+| Unreal Engine | C++ | 84,331 | 1,547,940 | 5,028,722 | 81.2% | 5m43s | 4.1 | 22.7s | 15.1x | 1,541 MB |
 <!-- speed-table-end -->
 
 Notes:
 
-- **Fresh** is a cold index from an empty database. **Cached** re-runs the same
-  index with every file unchanged, so almost all work is skipped.
+- **Index time** is a full index with the OS file cache warm (the common case
+  on a machine you work in). The very first cold index of a giant repo, with an
+  empty OS cache, runs slower: the Linux kernel and Unreal Engine were about
+  9 and 10 minutes respectively on the same machine cold. Everything mid-size and
+  down is a few seconds either way.
+- **Cached** re-runs the same index with every file unchanged, so almost all
+  work is skipped. This is what the JIT freshness path does after an edit, which
+  is why an agent never waits on a stale index.
 - **Resolved** is the share of call edges bound to a concrete definition. It is
   naturally lower in repos that lean heavily on external libraries, whose targets
   are not in the index. It is a health signal, not a quality grade.
@@ -44,6 +55,8 @@ Reproduce:
 npm run scale-test                 # all repos under Large Codebases/
 npm run scale-test -- --skip cbm   # the public benchmark set used here
 ```
+
+It writes a fresh `tests/outputs/latest.md` with your machine's numbers.
 
 ---
 

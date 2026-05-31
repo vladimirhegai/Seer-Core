@@ -12,13 +12,16 @@ command that writes them for you.
 From inside the repo you want indexed:
 
 ```bash
-seer init
+npx seer-mcp init
 ```
 
 This writes a project-local MCP config for Claude Code, Cursor, VS Code, Codex,
 and Gemini, and drops an `AGENTS.md` guidance block so the agent knows Seer
 exists and when to call it. It is idempotent: run it again and it leaves
 existing entries alone unless you pass `--force`.
+
+(If you installed Seer globally with `npm install -g seer-mcp`, the command is
+just `seer init`. From a source checkout it is `node dist/cli/index.js init`.)
 
 ### Options
 
@@ -36,20 +39,25 @@ existing entries alone unless you pass `--force`.
 
 ### What the launcher looks like
 
-By default `seer init` writes an absolute-path launcher, which works right now
-without publishing anything:
+`seer init` picks the right launcher automatically based on how Seer is
+installed:
 
-```
-node /abs/path/to/Seer-Core/dist/cli/index.js mcp --workspace /abs/path/to/your-repo
-```
+- **Installed from npm** (via `npx`, or a global/local install): it writes the
+  portable launcher, which works the same on any machine and is safe to commit.
 
-If you have published or linked the package, `--npx` gives you a portable
-launcher that any teammate can use as-is (it relies on the client starting the
-server with the repo as its working directory):
+  ```
+  npx -y seer-mcp mcp
+  ```
 
-```
-npx -y seer-mcp mcp
-```
+- **Running from a source checkout**: it writes an absolute path to your local
+  build, so changes you make are picked up without publishing.
+
+  ```
+  node /abs/path/to/Seer-Core/dist/cli/index.js mcp --workspace /abs/path/to/your-repo
+  ```
+
+Force the portable form with `--npx`, or override it entirely with
+`--command "<cmd>"`.
 
 ---
 

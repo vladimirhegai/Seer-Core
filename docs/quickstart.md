@@ -6,79 +6,46 @@ grepping around. This page gets you from zero to a connected agent.
 
 There is no account, no API key, and nothing leaves your machine.
 
----
-
-## 1. Install
-
-You need Node.js 18 or newer (Node 26+ recommended).
-
-### From source (works today)
-
-```bash
-git clone https://github.com/vladimirhegai/Seer-Core.git
-cd Seer-Core
-npm install
-npm run build
-```
-
-That produces the runnable CLI at `dist/cli/index.js`. If you want a global
-`seer` command, link it:
-
-```bash
-npm link        # now `seer` is on your PATH
-```
-
-### From npm
-
-Once published, the whole thing collapses to one line that every agent can run
-without a global install:
-
-```bash
-npx -y seer-mcp mcp
-```
+You need **Node.js 24 or newer** (the index uses the built-in `node:sqlite`,
+which runs without any flags on Node 24+).
 
 ---
 
-## 2. Connect your agent (the easy way)
+## The one-command setup
 
-Run `seer init` inside the repo you want indexed. It detects nothing magical;
-it just writes the right MCP config snippet to the right file for each agent,
-and drops an `AGENTS.md` so the agent knows the tool exists and how to use it.
+From inside the repo you want indexed:
 
 ```bash
-seer init
+npx seer-mcp init
 ```
 
-By default it configures the clients that support a project-local config file
-(Claude Code, Cursor, VS Code, Codex, Gemini) and leaves a shareable, committable
-config in your repo. Want everything, including the user-level ones?
+That is the whole install. It writes the MCP config for whatever agents you use
+(Claude Code, Cursor, VS Code, Codex, Gemini) and drops an `AGENTS.md` so the
+agent knows Seer exists and when to call it. Because it ran via `npx`, the config
+it writes uses a portable `npx -y seer-mcp mcp` launcher, so it works the same on
+any machine and is safe to commit.
+
+Then reload (or restart) your agent so it picks up the new server.
+
+### Useful variations
 
 ```bash
-seer init --client all
+npx seer-mcp init --client all     # also Antigravity and the user-level configs
+npx seer-mcp init --print          # dry run: show the snippets, write nothing
+npx seer-mcp init --client claude  # just one agent
 ```
 
-Pick specific agents:
-
-```bash
-seer init --client claude,cursor
-```
-
-See exactly what it would write without touching anything:
-
-```bash
-seer init --print
-```
-
-Full options live in [MCP Setup](mcp.md). If you would rather paste the snippet
-yourself, that page has the exact JSON/TOML for every client.
+`init` is idempotent and merges into existing config files without clobbering
+your other servers. Run it again any time; it leaves existing entries alone
+unless you pass `--force`. The exact per-client config (and how to paste it by
+hand) is in [MCP Setup](mcp.md).
 
 ---
 
-## 3. First query
+## First query
 
-Restart (or reload the MCP servers in) your agent. Seer indexes the workspace
-automatically the first time it is queried, so you do not have to run an index
-step by hand. Ask your agent something like:
+Seer indexes the workspace automatically the first time it is queried, so you do
+not run an index step by hand. Ask your agent something like:
 
 > Call seer_health, then give me the architecture overview.
 
@@ -87,19 +54,38 @@ connected.
 
 ---
 
-## 4. Using the CLI directly (optional)
+## Using the CLI directly (optional)
 
 The same engine works from a plain shell, which is handy for scripting or just
-poking around:
+poking around. With a global install you get a `seer` command:
 
 ```bash
+npm install -g seer-mcp
+
 seer index .                 # build/refresh the index
 seer architecture            # one-page overview of the repo
 seer symbols --top 20        # top symbols by PageRank
 seer preflight --symbol foo  # everything you need before editing `foo`
 ```
 
-The full command list is in the [CLI Reference](cli.md).
+Or run any command ad-hoc with `npx seer-mcp <command>`. The full command list
+is in the [CLI Reference](cli.md).
+
+---
+
+## From source (contributors)
+
+If you are hacking on Seer itself rather than just using it:
+
+```bash
+git clone https://github.com/vladimirhegai/Seer-Core.git
+cd Seer-Core
+npm install
+npm run build      # produces dist/cli/index.js
+```
+
+Run `seer init` from a source checkout and it writes a launcher that points at
+your local `dist/` build instead of `npx`, so you can test changes immediately.
 
 ---
 
