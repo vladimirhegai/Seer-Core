@@ -7,7 +7,7 @@ Give your AI agents a map of your repo before they edit.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![MCP](https://img.shields.io/badge/MCP-Enabled-brightgreen.svg)](docs/mcp.md)
 [![NodeJS](https://img.shields.io/badge/Node.js-%3E%3D_24-green.svg?logo=nodedotjs)](https://nodejs.org/)
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vladimirhegai/Seer-Core/actions)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vladimirhegai/Seer-MCP/actions)
 <br/><br/>
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-View_Report-green?style=for-the-badge)](docs/benchmarks.md)
 [![Testing](https://img.shields.io/badge/Testing-View_Specs-brightgreen?style=for-the-badge)](docs/testing.md)

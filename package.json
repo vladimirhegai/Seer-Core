@@ -29,9 +29,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vladimirhegai/Seer-Core.git"
+    "url": "git+https://github.com/vladimirhegai/Seer-MCP.git"
   },
-  "homepage": "https://github.com/vladimirhegai/Seer-Core#readme",
+  "homepage": "https://github.com/vladimirhegai/Seer-MCP#readme",
   "scripts": {
     "dev": "tsx src/cli/index.ts",
     "build": "tsc",

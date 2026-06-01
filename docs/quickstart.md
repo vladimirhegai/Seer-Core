@@ -87,8 +87,8 @@ is in the [CLI Reference](cli.md).
 If you are hacking on Seer itself rather than just using it:
 
 ```bash
-git clone https://github.com/vladimirhegai/Seer-Core.git
-cd Seer-Core
+git clone https://github.com/vladimirhegai/Seer-MCP.git
+cd Seer-MCP
 npm install
 npm run build      # produces dist/cli/index.js
 ```
