@@ -64,8 +64,10 @@ export interface McpServerOptions {
 function mcpInstructions(): string {
   return [
     'Use Seer first for structural code navigation in this workspace.',
+    'Core workflow: seer_health, then seer_search plus seer_definition/seer_file_symbols, then seer_context or seer_preflight, then seer_trace/seer_callers/seer_callees for drill-down.',
     'Before editing code, call seer_health once and confirm the workspace.',
     'If seer_health.workspace is not the active repo, report the stale/mispointed MCP session and ask the user to restart/reload after rerunning init; do not use stale Seer results for the task.',
+    'For normal code tasks, call Seer MCP tools directly; do not inspect MCP JSON/config files or run npx seer-mcp unless the task is installation/debugging or MCP tools are unavailable.',
     'If you know the target symbol, call seer_context or seer_preflight before reading files.',
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
@@ -329,7 +331,7 @@ export class SeerMcpServer {
 
   private registerTools(): void {
     this.registerTool('seer_health', {
-      description: 'Server health, schema, file/symbol counts, watcher status. Cheap; no JIT.',
+      description: 'CORE start-here tool. Confirms workspace, schema, file/symbol counts, watcher status. Cheap; no JIT.',
       inputSchema: {},
     }, async () => {
       const schema = this.store.schemaInfo();
@@ -412,7 +414,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_definition', {
-      description: 'Look up an exact symbol by name or qualified name. The optional `file` accepts an absolute path, the exact rel_path, OR a trailing path fragment on a segment boundary (e.g. "service.ts" or "auth/service.ts"). Excludes vendor/generated/test/declaration rows by default; pass include* to widen.',
+      description: 'CORE lookup tool. Find exact symbol definitions by name or qualified name. Pass `file` to disambiguate common symbols; accepts absolute path, exact rel_path, or trailing path fragment. Excludes vendor/generated/test/declaration rows by default.',
       inputSchema: {
         name: z.string(),
         file: z.string().optional(),
@@ -451,7 +453,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_file_symbols', {
-      description: 'List symbols defined in a file (sorted by line).',
+      description: 'CORE lookup tool. List symbols defined in a file, sorted by line; use after seer_search file hits or before reading a large file.',
       inputSchema: {
         file: z.string(),
         limit: z.number().int().positive().max(2000).optional(),
@@ -471,7 +473,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'Direct callers of a symbol, bounded preview + true total. Pass file to disambiguate common names or qualified names such as Class.method.',
+      description: 'CORE drill-down tool. Direct callers of a symbol with bounded preview + true total. Pass file to disambiguate common names or qualified names such as Class.method.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
@@ -512,7 +514,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callees', {
-      description: 'Direct callees of a symbol.',
+      description: 'CORE drill-down tool. Direct callees of a symbol.',
       inputSchema: {
         symbol: z.string(),
         limit: z.number().int().positive().max(500).optional(),
@@ -535,7 +537,7 @@ export class SeerMcpServer {
     // Search: BM25 across symbols + files. Each symbol hit also gets enriched
     // with the containing symbol when the match is non-symbol (e.g. file).
     this.registerTool('seer_search', {
-      description: 'Combined BM25 search across symbol names and file paths. Use this first; follow up with seer_definition / seer_file_symbols. Excludes vendor/generated/test/declaration rows by default.',
+      description: 'CORE discovery tool. Combined BM25 search across symbol names and file paths. Use this first when the target symbol/file is unknown; follow up with seer_definition or seer_file_symbols. Excludes vendor/generated/test/declaration rows by default.',
       inputSchema: {
         query: z.string().min(1),
         limit: z.number().int().positive().max(200).optional(),
@@ -1471,7 +1473,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_preflight', {
-      description: 'Compact "should I edit this?" evidence packet. Pass `symbol` for a single-symbol packet (risk, likely tests, service impact, history), or `fromRef`/`toRef` for a diff-range packet (touched symbols, aggregated risk, likely tests, service impact). Optional `oldBundle`/`newBundle` adds a contract diff to the packet. Output is structured facts only — no AI prose.',
+      description: 'CORE pre-edit tool. Compact "should I edit this?" evidence packet. Pass `symbol` for a single-symbol packet (risk, likely tests, service impact, history), or `fromRef`/`toRef` for a diff-range packet. Output is structured facts only.',
       inputSchema: {
         symbol: z.string().optional(),
         file: z.string().optional(),
@@ -1638,7 +1640,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_context', {
-      description: 'One compact pre-edit packet for a symbol: definition, callers, callees, routes, config, behavioral tests, recent history, complexity, module, blast radius, and deterministic risk. Use this as the first call before editing a symbol — then drill in with seer_callers / seer_history / seer_behavior as needed.',
+      description: 'CORE pre-edit tool. One compact packet for a symbol: definition, callers, callees, routes, config, behavioral tests, history, complexity, module, blast radius, and deterministic risk. Use before reading/editing a known symbol, then drill in with seer_callers, seer_history, or seer_behavior.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
@@ -1679,7 +1681,7 @@ export class SeerMcpServer {
 
     this.registerTool('seer_trace', {
       description:
-        'Unified graph-trace entry point. Set `scope` and pass the matching `args`:\n' +
+        'CORE drill-down tool. Unified graph-trace entry point. Set `scope` and pass the matching `args`:\n' +
         '• callers {symbol, file?, maxDepth?, maxNodes?, limit?} — transitive reverse callers (blast radius)\n' +
         '• callees {symbol, maxDepth?, maxNodes?, limit?} — transitive forward callees\n' +
         '• path {from, to, maxDepth?} — shortest call path A→B\n' +
@@ -1722,7 +1724,7 @@ export class SeerMcpServer {
 
     this.registerTool('seer_batch', {
       description:
-        'Run several read-only Seer tools in one call and get all results back together. ' +
+        'CORE efficiency tool. Run several read-only Seer tools in one call and get all results back together. ' +
         'Saves turns when the fan-out is known up front (e.g. definition + callers + behavior + risk for one symbol). ' +
         'Each entry is {tool, args}. Calls run sequentially in one process; one failure never aborts the rest. ' +
         'seer_batch cannot nest, and it is intended for read-only tools.',

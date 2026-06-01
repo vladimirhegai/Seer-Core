@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 
 /**
  * `seer init` — one command that wires Seer into whatever AI coding agents a
@@ -182,6 +183,10 @@ interface ClientSpec {
   toml?: boolean;
   /** Some workspace-local clients launch MCP from the editor process cwd. */
   projectWorkspaceArg?: boolean;
+  /** Some clients cache MCP servers by id across workspaces; make Seer id repo-specific. */
+  workspaceServerName?: boolean;
+  /** Some clients support cwd and otherwise launch stdio servers from the editor install dir. */
+  cwd?: boolean;
 }
 
 function home(...p: string[]): string {
@@ -232,6 +237,8 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
     ],
     rootKey: 'mcpServers',
     projectWorkspaceArg: true,
+    workspaceServerName: true,
+    cwd: true,
   },
   windsurf: {
     label: 'Windsurf',
@@ -248,6 +255,30 @@ interface TargetSpec {
 
 function targetPath(workspace: string, target: string): string {
   return path.isAbsolute(target) ? target : path.join(workspace, target);
+}
+
+function workspaceSlug(workspace: string): string {
+  const base = path.basename(path.resolve(workspace)) || 'workspace';
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 32) || 'workspace';
+}
+
+function workspaceHash(workspace: string): string {
+  return crypto.createHash('sha1').update(path.resolve(workspace).toLowerCase()).digest('hex').slice(0, 8);
+}
+
+function serverNameFor(spec: ClientSpec, workspace: string): string {
+  if (!spec.workspaceServerName) return 'seer';
+  return `seer_${workspaceSlug(workspace)}_${workspaceHash(workspace)}`;
+}
+
+function isManagedSeerServerName(name: string): boolean {
+  return name === 'seer' || /^seer[_-][a-z0-9][a-z0-9_-]*$/i.test(name);
+}
+
+function seerServerNames(spec: ClientSpec, root: any): string[] {
+  if (!root || typeof root !== 'object') return [];
+  if (!spec.workspaceServerName) return root.seer ? ['seer'] : [];
+  return Object.keys(root).filter(isManagedSeerServerName);
 }
 
 function pruneEmptyParents(file: string, stopDir: string): void {
@@ -301,7 +332,7 @@ function jsonHasSeer(spec: ClientSpec, file: string): boolean | null {
   const parsed = readJsonTolerant(file);
   if (!parsed.ok) return null;
   const root = parsed.data?.[spec.rootKey];
-  return !!(root && typeof root === 'object' && root.seer);
+  return seerServerNames(spec, root).length > 0;
 }
 
 function tomlHasSeer(file: string): boolean {
@@ -329,17 +360,18 @@ export function detectConfiguredClients(
     return clientTargets(client, resolvedWorkspace, scope).some((target) => {
       if (hasSeerEntry(client, target.file) !== true) return false;
       if (!target.isGlobal || opts.includePinnedOther) return true;
-      const pinnedWorkspace = entryWorkspace(spec, target.file);
+      const pinnedWorkspace = entryWorkspace(spec, target.file, resolvedWorkspace);
       return pinnedWorkspace === undefined || pinnedWorkspace === null || sameResolvedPath(pinnedWorkspace, resolvedWorkspace);
     });
   });
 }
 
-function jsonEntry(launch: LaunchSpec, stdioType: boolean): Record<string, any> {
+function jsonEntry(launch: LaunchSpec, stdioType: boolean, cwd?: string): Record<string, any> {
   const entry: Record<string, any> = {};
   if (stdioType) entry.type = 'stdio';
   entry.command = launch.command;
   entry.args = launch.args;
+  if (cwd) entry.cwd = cwd;
   return entry;
 }
 
@@ -360,16 +392,31 @@ function workspaceFromArgs(args: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? path.resolve(value) : undefined;
 }
 
+function workspaceFromJsonEntry(entry: any): string | undefined {
+  return workspaceFromArgs(entry?.args) ??
+    (typeof entry?.cwd === 'string' && entry.cwd.trim() ? path.resolve(entry.cwd) : undefined);
+}
+
 function sameResolvedPath(a: string, b: string): boolean {
   return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 }
 
-function jsonEntryWorkspace(spec: ClientSpec, file: string): string | undefined | null {
+function jsonEntryWorkspace(spec: ClientSpec, file: string, workspace?: string): string | undefined | null {
   const parsed = readJsonTolerant(file);
   if (!parsed.ok) return null;
-  const entry = parsed.data?.[spec.rootKey]?.seer;
-  if (!entry || typeof entry !== 'object') return undefined;
-  return workspaceFromArgs(entry.args);
+  const root = parsed.data?.[spec.rootKey];
+  const names = seerServerNames(spec, root);
+  if (names.length === 0) return undefined;
+  if (workspace && spec.workspaceServerName) {
+    const expected = serverNameFor(spec, workspace);
+    const preferred = names.find((name) => name === expected) ??
+      names.find((name) => {
+        const pinned = workspaceFromJsonEntry(root[name]);
+        return pinned ? sameResolvedPath(pinned, workspace) : false;
+      });
+    if (preferred) return workspaceFromJsonEntry(root[preferred]);
+  }
+  return workspaceFromJsonEntry(root[names[0]]);
 }
 
 function tomlEntryWorkspace(file: string): string | undefined | null {
@@ -390,8 +437,8 @@ function tomlEntryWorkspace(file: string): string | undefined | null {
   catch { return null; }
 }
 
-function entryWorkspace(spec: ClientSpec, file: string): string | undefined | null {
-  return spec.toml ? tomlEntryWorkspace(file) : jsonEntryWorkspace(spec, file);
+function entryWorkspace(spec: ClientSpec, file: string, workspace?: string): string | undefined | null {
+  return spec.toml ? tomlEntryWorkspace(file) : jsonEntryWorkspace(spec, file, workspace);
 }
 
 function writeJsonClient(
@@ -402,8 +449,9 @@ function writeJsonClient(
   updateExisting = false,
 ): PlanEntry {
   const base: PlanEntry = { client: 'claude', label: spec.label, file, action: 'wrote' };
-  const entry = jsonEntry(launch, !!spec.stdioType);
-  const snippet = JSON.stringify({ [spec.rootKey]: { seer: entry } }, null, 2);
+  const serverName = serverNameFor(spec, opts.workspace);
+  const entry = jsonEntry(launch, !!spec.stdioType, spec.cwd ? opts.workspace : undefined);
+  const snippet = JSON.stringify({ [spec.rootKey]: { [serverName]: entry } }, null, 2);
 
   if (opts.print) {
     return { ...base, action: fs.existsSync(file) ? 'updated' : 'wrote', snippet, note: 'dry run' };
@@ -426,15 +474,32 @@ function writeJsonClient(
   }
 
   if (!data[spec.rootKey] || typeof data[spec.rootKey] !== 'object') data[spec.rootKey] = {};
-  if (data[spec.rootKey].seer && !opts.force) {
+  const root = data[spec.rootKey];
+
+  // Antigravity can keep MCP servers alive across workspaces by server id.
+  // Migrate the old shared "seer" id into the deterministic workspace id so
+  // Project A and Project B do not fight over one cached process.
+  let migratedLegacy = false;
+  if (spec.workspaceServerName && root.seer) {
+    const legacyWorkspace = workspaceFromJsonEntry(root.seer) ?? opts.workspace;
+    const legacyName = serverNameFor(spec, legacyWorkspace);
+    if (!root[legacyName]) root[legacyName] = root.seer;
+    delete root.seer;
+    migratedLegacy = true;
+  }
+
+  if (root[serverName] && !opts.force) {
     if (!updateExisting) {
-      return { ...base, action: 'skipped', note: 'seer entry already present (use --force to overwrite)' };
-    }
-    if (JSON.stringify(data[spec.rootKey].seer) === JSON.stringify(entry)) {
-      return { ...base, action: 'skipped', note: 'seer entry already current' };
+      if (!migratedLegacy) {
+        return { ...base, action: 'skipped', note: 'seer entry already present (use --force to overwrite)' };
+      }
+    } else if (JSON.stringify(root[serverName]) === JSON.stringify(entry)) {
+      if (!migratedLegacy) {
+        return { ...base, action: 'skipped', note: 'seer entry already current' };
+      }
     }
   }
-  data[spec.rootKey].seer = entry;
+  root[serverName] = entry;
 
   ensureDir(file);
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
@@ -537,18 +602,27 @@ function agentsBlock(): string {
     'involves symbols, callers, tests, dependencies, boundaries, risk, or git',
     'history.',
     '',
+    'Core tools:',
+    '- `seer_health`: confirm this Seer server is for this repo.',
+    '- `seer_search`: find symbols or files when you do not know the exact target.',
+    '- `seer_definition` / `seer_file_symbols`: resolve the best hit.',
+    '- `seer_context` / `seer_preflight`: gather edit evidence before reading or changing code.',
+    '- `seer_trace`, `seer_callers`, `seer_callees`: drill into impact paths.',
+    '',
     'Required workflow before editing code:',
     '1. Call `seer_health` once and confirm `workspace` is this repo.',
     '2. If `seer_health.workspace` is not this repo, stop using Seer for this',
     '   task and tell the user to restart/reload the agent after running',
     '   `npx seer-mcp init --auto --force` in this repo.',
-    '3. If you know the target symbol, call `seer_context { symbol }` or',
+    '3. If `seer_health` is unavailable or times out, report that the MCP',
+    '   session is stale/unavailable; do not inspect Seer config or use stale results.',
+    '4. If you know the target symbol, call `seer_context { symbol }` or',
     '   `seer_preflight { symbol }` before reading files.',
-    '4. If you do not know the symbol, call `seer_search` first, then',
+    '5. If you do not know the symbol, call `seer_search` first, then',
     '   `seer_definition` or `seer_file_symbols` on the best hit.',
-    '5. For common method names, pass `file` to `seer_context`, `seer_callers`,',
+    '6. For common method names, pass `file` to `seer_context`, `seer_callers`,',
     '   or `seer_trace` callers so Seer uses the exact symbol definition.',
-    '6. For changes already in the working tree, call `seer_preflight` with',
+    '7. For changes already in the working tree, call `seer_preflight` with',
     '   `fromRef`/`toRef` or the target symbol before summarizing impact.',
     '',
     'Common follow-ups:',
@@ -562,6 +636,12 @@ function agentsBlock(): string {
     'Use `rg` or manual file reads after Seer for literal strings, comments,',
     'docs, config values, unsupported languages, or when Seer returns no',
     'useful hit from the correct workspace.',
+    '',
+    'Do not read `.agents/mcp_config.json`, `.mcp.json`, `.cursor/mcp.json`,',
+    'or other MCP config files during normal code tasks. Only inspect or edit',
+    'those files when the user asks to install, update, uninstall, or debug Seer.',
+    'Do not run `npx seer-mcp` as a substitute for MCP tools when the MCP tools',
+    'are available.',
     AGENTS_END,
   ].join('\n');
 }
@@ -648,7 +728,7 @@ export interface UninstallResult {
   contextFiles: UninstallEntry[];
 }
 
-/** Remove `mcpServers.seer` (or `servers.seer`) from a JSON config file. */
+/** Remove Seer MCP entries from a JSON config file. */
 function removeJsonClient(
   spec: ClientSpec,
   file: string,
@@ -666,24 +746,30 @@ function removeJsonClient(
 
   const data = parsed.data ?? {};
   const root = data[spec.rootKey];
-  if (!root || typeof root !== 'object' || !('seer' in root)) {
+  const names = seerServerNames(spec, root);
+  if (!root || typeof root !== 'object' || names.length === 0) {
     return base; // nothing to remove
   }
 
-  if (targetIsGlobal && !opts.force) {
-    const pinnedWorkspace = workspaceFromArgs(root.seer?.args);
-    if (pinnedWorkspace && !sameResolvedPath(pinnedWorkspace, opts.workspace)) {
-      return {
-        ...base,
-        action: 'skipped',
-        note: `seer entry is pinned to another workspace: ${pinnedWorkspace}`,
-      };
-    }
+  const removable = names.filter((name) => {
+    if (!targetIsGlobal || opts.force) return true;
+    const pinnedWorkspace = workspaceFromJsonEntry(root[name]);
+    return !pinnedWorkspace || sameResolvedPath(pinnedWorkspace, opts.workspace);
+  });
+  if (removable.length === 0) {
+    const pinned = names
+      .map((name) => workspaceFromJsonEntry(root[name]))
+      .filter((value): value is string => !!value);
+    return {
+      ...base,
+      action: 'skipped',
+      note: pinned.length ? `seer entry is pinned to another workspace: ${pinned.join(', ')}` : undefined,
+    };
   }
 
   if (opts.print) return { ...base, action: 'removed' };
 
-  delete root.seer;
+  for (const name of removable) delete root[name];
 
   // If the root key is now empty, drop it too.
   if (Object.keys(root).length === 0) delete data[spec.rootKey];
@@ -863,7 +949,7 @@ function refreshClient(client: ClientId, opts: UpdateOptions): PlanEntry[] {
     }
 
     if (target.isGlobal && !opts.force) {
-      const pinnedWorkspace = entryWorkspace(spec, target.file);
+      const pinnedWorkspace = entryWorkspace(spec, target.file, opts.workspace);
       if (pinnedWorkspace === null) {
         results.push({
           client,

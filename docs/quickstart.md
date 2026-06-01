@@ -36,7 +36,9 @@ npx seer-mcp init --auto
 ```
 
 Project A and Project B now both have Seer. No re-pointing is needed when the
-agent loads each repo's local MCP config.
+agent loads each repo's local MCP config. Antigravity uses a repo-specific MCP
+server id, such as `seer_godot_a1b2c3d4`, so two projects do not share one
+cached `seer` process.
 
 Use a narrower command when you know the client:
 
@@ -52,7 +54,8 @@ Use a narrower command when you know the client:
 | Everything supported | `npx seer-mcp init --client all` |
 | Workspace-local defaults only | `npx seer-mcp init` |
 
-Use `--force` if you intentionally want to replace an existing `seer` entry.
+Use `--force` if you intentionally want to replace an existing `seer` /
+`seer_<workspace>` entry.
 
 Use `--global` only when you want Seer in a user-level config file:
 
@@ -61,7 +64,9 @@ npx seer-mcp init --client antigravity --global --force
 ```
 
 Global/user-level entries include `--workspace <repo>` because they do not
-belong to one project folder.
+belong to one project folder. For Antigravity, prefer the workspace-local
+command first; the global fallback can expose multiple repo-specific Seer
+servers to every Antigravity workspace.
 
 ## Verify
 
@@ -145,7 +150,7 @@ This is the normal flow for:
 
 | Client | Default Seer scope |
 |---|---|
-| Antigravity IDE / CLI | Workspace-local `.agents/mcp_config.json`, pinned with `--workspace` |
+| Antigravity IDE / CLI | Workspace-local `.agents/mcp_config.json`, pinned with `--workspace`, `cwd`, and a repo-specific server id |
 | Claude Code CLI | Workspace-local `.mcp.json` |
 | Cursor | Workspace-local `.cursor/mcp.json` |
 | VS Code native MCP / Copilot | Workspace-local `.vscode/mcp.json` |
@@ -164,8 +169,10 @@ If a user-level entry points to the wrong repo, `seer_health` will show it.
 Re-run the explicit command from the repo you want active.
 
 Antigravity's config is still stored in the repo, but Seer pins `--workspace`
-inside that file because the IDE can launch MCP from the Antigravity install
-directory instead of the repo.
+and `cwd` inside that file because the IDE can launch MCP from the Antigravity
+install directory instead of the repo. The server key is repo-specific
+(`seer_<repo>_<hash>`) so Antigravity does not reuse Project A's Seer process
+inside Project B.
 
 ## Update
 
@@ -270,4 +277,7 @@ projects. The global fallback uses `~/.codex/config.toml`.
 npx seer-mcp init --client antigravity --global --force
 ```
 
-This writes Antigravity's user-level MCP file and pins it to the current repo.
+This writes Antigravity's user-level MCP file and pins it to the current repo
+with `--workspace`, `cwd`, and a repo-specific server id. Prefer
+workspace-local setup unless the IDE is definitely not loading
+`.agents/mcp_config.json`.

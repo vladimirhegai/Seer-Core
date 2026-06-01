@@ -242,12 +242,22 @@ function globalNpxLaunchersCarryWorkspace(): void {
 
     const ag = runInit({ workspace: ws, clients: ['antigravity'], npx: true, print: true });
     const projectEntry = ag.entries.find(e => e.file.endsWith(path.join('.agents', 'mcp_config.json')));
-    const projectArgs = JSON.parse(projectEntry?.snippet ?? '{}').mcpServers?.seer?.args as string[] | undefined;
+    const projectRoot = JSON.parse(projectEntry?.snippet ?? '{}').mcpServers ?? {};
+    const projectKey = Object.keys(projectRoot).find((k) => /^seer[_-]/.test(k) || k === 'seer');
+    const projectEntryJson = projectKey ? projectRoot[projectKey] : undefined;
+    const projectArgs = projectEntryJson?.args as string[] | undefined;
     const agGlobal = runInit({ workspace: ws, clients: ['antigravity'], npx: true, global: true, print: true });
     const globalEntries = agGlobal.entries.filter(e => path.isAbsolute(e.file) && !e.file.startsWith(ws));
     check(Boolean(projectArgs?.includes('--workspace') && projectArgs.includes(ws)),
       'Antigravity workspace-local entry pins workspace because IDE cwd can be outside repo', projectArgs);
+    check(Boolean(projectKey && /^seer_/.test(projectKey) && projectEntryJson?.cwd === ws),
+      'Antigravity workspace-local entry uses repo-specific server id and cwd', { projectKey, projectEntryJson });
     check(globalEntries.every(e => (e.snippet ?? '').includes('--workspace')), 'Antigravity --global entries pin workspace', globalEntries.map(e => e.snippet));
+    check(globalEntries.every(e => {
+      const root = JSON.parse(e.snippet ?? '{}').mcpServers ?? {};
+      const key = Object.keys(root).find((k) => /^seer_/.test(k));
+      return Boolean(key && root[key]?.cwd === ws);
+    }), 'Antigravity --global entries use repo-specific server ids and cwd', globalEntries.map(e => e.snippet));
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
   }

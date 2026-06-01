@@ -55,7 +55,9 @@ Use this when you want Seer set up for the current repo. It writes
 workspace-local MCP config only. If you have Project A and Project B, run the
 same command in each repo; both keep their own Seer config and index.
 Antigravity's repo-local config includes `--workspace` because the IDE can
-launch MCP from the Antigravity install directory.
+launch MCP from the Antigravity install directory. Its server id is also
+workspace-specific, such as `seer_godot_a1b2c3d4`, so two Antigravity projects
+do not fight over one cached `seer` process.
 
 Common installs:
 
@@ -75,7 +77,7 @@ Useful flags:
 - `--client <name>`: target one client, or use `all`.
 - `--global`: write user-level config for clients that support it.
 - `--print`: preview files before writing.
-- `--force`: replace an existing `seer` entry.
+- `--force`: replace an existing `seer` / `seer_<workspace>` entry.
 
 Restart/reload your agent, then ask it to call:
 

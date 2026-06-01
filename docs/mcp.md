@@ -56,8 +56,10 @@ the repo:
 npx -y seer-mcp mcp --workspace C:/path/to/repo
 ```
 
-Antigravity workspace config also includes `--workspace` because the IDE may
-launch MCP from its own install directory.
+Antigravity workspace config also includes `--workspace` and `cwd` because the
+IDE may launch MCP from its own install directory. Seer also gives Antigravity a
+repo-specific server id such as `seer_godot_a1b2c3d4`; this prevents Project A
+and Project B from sharing one cached `seer` process.
 
 If `seer_health` shows your editor directory or another repo instead of the
 active repo, the agent is using a stale/mispointed MCP process. Rerun setup from
@@ -82,9 +84,9 @@ file. For Antigravity, that file is `.agents/mcp_config.json`.
 | VS Code native MCP / Copilot | `.vscode/mcp.json` | `servers.seer` | repo |
 | Codex | `.codex/config.toml` | `mcp_servers.seer` | repo |
 | Gemini CLI | `.gemini/settings.json` | `mcpServers.seer` | repo |
-| Antigravity workspace | `.agents/mcp_config.json` | `mcpServers.seer` | repo, pinned |
-| Antigravity user with `--global` | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.seer` | user |
-| Antigravity compatibility with `--global` | `~/.gemini/antigravity-cli/mcp_config.json`, `~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity-ide/mcp_config.json` | `mcpServers.seer` | user |
+| Antigravity workspace | `.agents/mcp_config.json` | `mcpServers.seer_<repo>_<hash>` | repo, pinned |
+| Antigravity user with `--global` | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.seer_<repo>_<hash>` | user |
+| Antigravity compatibility with `--global` | `~/.gemini/antigravity-cli/mcp_config.json`, `~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity-ide/mcp_config.json` | `mcpServers.seer_<repo>_<hash>` | user |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers.seer` | user |
 
 Instruction files:
@@ -117,9 +119,10 @@ Antigravity workspace JSON:
 ```json
 {
   "mcpServers": {
-    "seer": {
+    "seer_myrepo_a1b2c3d4": {
       "command": "npx",
-      "args": ["-y", "seer-mcp", "mcp", "--workspace", "C:/path/to/repo"]
+      "args": ["-y", "seer-mcp", "mcp", "--workspace", "C:/path/to/repo"],
+      "cwd": "C:/path/to/repo"
     }
   }
 }
@@ -182,7 +185,8 @@ npx seer-mcp init --client antigravity --global --force
 
 Use this only if Antigravity IDE does not load `.agents/mcp_config.json` after a
 reload. The fallback writes Antigravity's user-level MCP file and pins the
-current repo with `--workspace`.
+current repo with `--workspace`, `cwd`, and a repo-specific server id. Prefer
+workspace-local setup so unrelated repos do not see each other's Seer servers.
 
 ## Update
 

@@ -30,6 +30,12 @@ function freshWs(tag: string): string {
   return ws;
 }
 
+function antigravitySeerEntry(config: any): { key: string; entry: any } {
+  const root = config.mcpServers ?? {};
+  const key = Object.keys(root).find((k) => /^seer[_-]/.test(k) || k === 'seer') ?? '';
+  return { key, entry: key ? root[key] : undefined };
+}
+
 function main(): void {
   console.log('\nSeer Init Tests\n===============\n');
 
@@ -57,9 +63,11 @@ function main(): void {
     check(!!gemini.mcpServers?.seer, '1.gemini .gemini/settings.json has mcpServers.seer');
 
     const ag = JSON.parse(fs.readFileSync(path.join(ws, '.agents', 'mcp_config.json'), 'utf8'));
-    check(!!ag.mcpServers?.seer, '1.antigravity .agents/mcp_config.json has mcpServers.seer');
-    check(ag.mcpServers.seer.args.includes('--workspace') && ag.mcpServers.seer.args.includes(ws),
-      '1.antigravity workspace config pins workspace because IDE cwd can be outside repo', ag.mcpServers.seer.args);
+    const agSeer = antigravitySeerEntry(ag);
+    check(/^seer_/.test(agSeer.key), '1.antigravity uses a workspace-specific server id', ag.mcpServers);
+    check(agSeer.entry.args.includes('--workspace') && agSeer.entry.args.includes(ws),
+      '1.antigravity workspace config pins workspace because IDE cwd can be outside repo', agSeer.entry.args);
+    check(agSeer.entry.cwd === ws, '1.antigravity entry carries cwd for editor-launched stdio', agSeer.entry);
 
     const toml = fs.readFileSync(path.join(ws, '.codex', 'config.toml'), 'utf8');
     check(/\[mcp_servers\.seer\]/.test(toml), '1.codex config.toml has [mcp_servers.seer]');
@@ -97,11 +105,38 @@ function main(): void {
     check(!files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
       '6b.antigravity default does not plan user-level config', files);
     const snippet = r.entries.find((e) => e.file.endsWith(path.join('.agents', 'mcp_config.json')))?.snippet ?? '';
-    const args = JSON.parse(snippet).mcpServers.seer.args as string[];
+    const preview = antigravitySeerEntry(JSON.parse(snippet));
+    const args = preview.entry.args as string[];
+    check(/^seer_/.test(preview.key), '6b.antigravity dry-run server id is workspace-specific', preview.key);
     check(args.includes('--workspace') && args.includes(ws),
       '6b.antigravity workspace config includes --workspace', args);
+    check(preview.entry.cwd === ws, '6b.antigravity dry-run entry includes cwd', preview.entry);
     check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
       '6b.--print does not write antigravity workspace config');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('antigravity-legacy');
+    const file = path.join(ws, '.agents', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      mcpServers: {
+        seer: {
+          command: 'npx',
+          args: ['-y', 'seer-mcp', 'mcp', '--workspace', ws],
+        },
+      },
+    }, null, 2));
+
+    const r = runInit({ workspace: ws, clients: ['antigravity'] });
+    const ag = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const agSeer = antigravitySeerEntry(ag);
+    check(r.entries.some((e) => e.client === 'antigravity' && e.action === 'updated'),
+      '6d.antigravity legacy generic seer entry is migrated', r.entries);
+    check(!('seer' in ag.mcpServers), '6d.antigravity legacy generic seer key removed', ag.mcpServers);
+    check(/^seer_/.test(agSeer.key) && agSeer.entry.args.includes(ws),
+      '6d.antigravity migrated entry is workspace-specific and pinned', { key: agSeer.key, entry: agSeer.entry });
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
