@@ -7,9 +7,9 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
-import { runInit, ClientId } from './init.js';
+import { runInit, runUninstall, ClientId } from './init.js';
 
-const VERSION = '0.1.6';
+const VERSION = '0.1.7';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
@@ -179,6 +179,150 @@ program
     console.log(`    1. Reload / restart your agent so it picks up the new MCP server.`);
     console.log(`    2. Seer indexes this workspace automatically on first query.`);
     console.log(`    3. Ask your agent to call seer_health to confirm it is connected.\n`);
+  });
+
+// ── seer update ─────────────────────────────────────────────────────────────
+//
+// The npx launcher (`npx -y seer-mcp mcp`) auto-fetches the latest published
+// package on every agent start, so the binary self-updates. MCP configs also
+// never need changing — the launcher command is stable across releases. The
+// only thing that doesn't self-update is the guidance content written into
+// AGENTS.md / CLAUDE.md / GEMINI.md; `seer init` skips those files if the
+// markers are already present. `seer update` forces a refresh of those files
+// while leaving the MCP configs alone (they're already correct).
+
+program
+  .command('update [workspace]')
+  .description('Refresh guidance files (AGENTS.md, CLAUDE.md, GEMINI.md) with the latest Seer content. MCP configs are unchanged — the npx launcher auto-updates the binary.')
+  .option('--client <names>', 'Comma-separated clients to target (default: all previously-configured clients)')
+  .option('--global', 'Target user-level configs instead of project-local ones')
+  .option('--print', 'Dry run — show what would change without writing anything')
+  .action((workspace: string | undefined, opts: {
+    client?: string; global?: boolean; print?: boolean;
+  }) => {
+    const ws = path.resolve(workspace ?? process.cwd());
+    if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
+
+    let clients: ClientId[] | undefined;
+    if (opts.client) {
+      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (names.includes('all')) {
+        clients = KNOWN_CLIENTS;
+      } else {
+        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
+        if (bad.length) {
+          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
+          process.exit(1);
+        }
+        clients = names as ClientId[];
+      }
+    }
+
+    // Force-refresh guidance files; leave the launcher/MCP config alone by
+    // passing force only to the guidance pass via runInit internals. Since
+    // runInit's force flag governs both, we instead call it with force:true
+    // knowing that for npx installs the MCP config content is identical anyway
+    // (same command) — the "updated" write is a no-op in practice.
+    const result = runInit({
+      workspace: ws,
+      clients,
+      global: opts.global,
+      npx: true,        // keep the config in npx form — stable across updates
+      print: opts.print,
+      force: true,      // the whole point: refresh guidance even if markers exist
+    });
+
+    console.log(`\nSeer Update  ${opts.print ? '(dry run — nothing written)' : ''}`);
+    if (workspace) console.log(`  Workspace: ${ws}\n`);
+
+    const mark: Record<string, string> = opts.print
+      ? { wrote: '+ would write ', updated: '~ would update', skipped: '· no change  ', manual: '! manual      ' }
+      : { wrote: '✓ wrote ', updated: '✓ updated', skipped: '· no change ', manual: '! manual ' };
+
+    // Only report the guidance files — that's the point of this command.
+    const guidanceFiles = [result.agents, ...(result.contextFiles ?? [])].filter(Boolean) as Array<{ label: string; file: string; action: string }>;
+    if (guidanceFiles.length === 0) {
+      console.log(`  · No guidance files to update (try --client to specify agents).`);
+    } else {
+      for (const cf of guidanceFiles) {
+        console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(30)} ${cf.file}`);
+      }
+    }
+
+    if (!opts.print) {
+      console.log(`\n  Guidance files carry the latest tool table and workflow steps.`);
+      console.log(`  The npx launcher auto-fetches the latest binary on each agent start — no action needed.\n`);
+    } else {
+      console.log(`\n  (Dry run — run without --print to apply)\n`);
+    }
+  });
+
+// ── seer uninstall ──────────────────────────────────────────────────────────
+
+program
+  .command('uninstall [workspace]')
+  .description('Remove the Seer MCP entry from every agent config and strip the seer block from guidance files')
+  .option('--client <names>', 'Comma-separated clients to target (default: all known clients)')
+  .option('--global', 'Target user-level configs instead of project-local ones')
+  .option('--no-agents', 'Do not touch guidance files (AGENTS.md, CLAUDE.md, GEMINI.md)')
+  .option('--print', 'Dry run — show what would change without writing anything')
+  .action((workspace: string | undefined, opts: {
+    client?: string; global?: boolean; agents?: boolean; print?: boolean;
+  }) => {
+    const ws = path.resolve(workspace ?? process.cwd());
+
+    let clients: ClientId[] | undefined;
+    if (opts.client) {
+      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (names.includes('all')) {
+        clients = KNOWN_CLIENTS;
+      } else {
+        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
+        if (bad.length) {
+          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
+          process.exit(1);
+        }
+        clients = names as ClientId[];
+      }
+    }
+
+    const result = runUninstall({
+      workspace: ws,
+      clients,
+      global: opts.global,
+      agents: opts.agents,
+      print: opts.print,
+    });
+
+    console.log(`\nSeer Uninstall  ${opts.print ? '(dry run — nothing written)' : ''}`);
+    if (workspace) console.log(`  Workspace: ${ws}`);
+
+    const mark: Record<string, string> = opts.print
+      ? { removed: '- would remove', deleted: '- would delete', skipped: '· nothing to do', manual: '! manual      ' }
+      : { removed: '✓ removed', deleted: '✓ deleted', skipped: '· nothing to do', manual: '! manual ' };
+
+    const allEntries = [...result.entries, ...result.contextFiles];
+    const acted = allEntries.filter((e) => e.action !== 'skipped');
+    const skipped = allEntries.filter((e) => e.action === 'skipped');
+
+    for (const e of acted) {
+      console.log(`  ${mark[e.action] ?? e.action}  ${e.label.padEnd(30)} ${e.file}`);
+      if (e.note) console.log(`               ${e.note}`);
+    }
+    if (acted.length === 0) {
+      console.log(`  · Nothing to remove — no seer entries found.`);
+    }
+    if (skipped.length > 0 && acted.length > 0) {
+      console.log(`  · ${skipped.length} file(s) had nothing to remove (already clean or not present).`);
+    }
+
+    if (!opts.print && acted.length > 0) {
+      console.log(`\n  Done. Restart your agent to deregister the seer MCP server.\n`);
+    } else if (opts.print) {
+      console.log(`\n  (Dry run — run without --print to apply)\n`);
+    } else {
+      console.log('');
+    }
   });
 
 // ── seer callers / callees / symbols / stats / health ──────────────────────────

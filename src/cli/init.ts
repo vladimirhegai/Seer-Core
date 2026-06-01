@@ -463,6 +463,187 @@ function writeContextFile(
   return { file, label, action: 'wrote' };
 }
 
+// ── Uninstall ────────────────────────────────────────────────────────────────
+
+export type UninstallAction =
+  | 'removed'    // seer entry deleted; file still has other content
+  | 'deleted'    // whole file removed (was seer-only or empty after removal)
+  | 'skipped'    // file did not exist or had no seer entry
+  | 'manual';    // file exists but could not be parsed / modified safely
+
+export interface UninstallEntry {
+  label: string;
+  file: string;
+  action: UninstallAction;
+  note?: string;
+}
+
+export interface UninstallOptions {
+  workspace: string;
+  clients?: ClientId[];
+  global?: boolean;
+  agents?: boolean;   // also strip guidance files (default true)
+  print?: boolean;    // dry run — report, do not write
+}
+
+export interface UninstallResult {
+  entries: UninstallEntry[];
+  contextFiles: UninstallEntry[];
+}
+
+/** Remove `mcpServers.seer` (or `servers.seer`) from a JSON config file. */
+function removeJsonClient(
+  spec: ClientSpec,
+  file: string,
+  opts: UninstallOptions,
+): UninstallEntry {
+  const base: UninstallEntry = { label: spec.label, file, action: 'skipped' };
+
+  if (!fs.existsSync(file)) return base;
+
+  const parsed = readJsonTolerant(file);
+  if (!parsed.ok) {
+    return { ...base, action: 'manual', note: `could not parse ${path.basename(file)}; remove the seer entry by hand` };
+  }
+
+  const data = parsed.data ?? {};
+  const root = data[spec.rootKey];
+  if (!root || typeof root !== 'object' || !('seer' in root)) {
+    return base; // nothing to remove
+  }
+
+  if (opts.print) return { ...base, action: 'removed' };
+
+  delete root.seer;
+
+  // If the root key is now empty, drop it too.
+  if (Object.keys(root).length === 0) delete data[spec.rootKey];
+
+  // If the whole file is now empty (only had seer), delete it.
+  const remaining = Object.keys(data);
+  if (remaining.length === 0) {
+    fs.unlinkSync(file);
+    return { ...base, action: 'deleted' };
+  }
+
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  return { ...base, action: 'removed' };
+}
+
+/** Remove `[mcp_servers.seer]` block from a TOML config file. */
+function removeTomlClient(
+  spec: ClientSpec,
+  file: string,
+  opts: UninstallOptions,
+): UninstallEntry {
+  const base: UninstallEntry = { label: spec.label, file, action: 'skipped' };
+
+  if (!fs.existsSync(file)) return base;
+
+  const raw = fs.readFileSync(file, 'utf8');
+  if (!/^[ \t]*\[mcp_servers\.seer\]/m.test(raw)) return base;
+
+  if (opts.print) return { ...base, action: 'removed' };
+
+  const lines = raw.split('\n');
+  const start = lines.findIndex((l) => /^[ \t]*\[mcp_servers\.seer\]/.test(l));
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^[ \t]*\[/.test(lines[i])) { end = i; break; }
+  }
+
+  // Drop the block lines (and any trailing blank line immediately before the
+  // next section so we don't leave a double blank).
+  const kept = [...lines.slice(0, start), ...lines.slice(end)];
+  // Trim a leading blank line that was the separator before the block.
+  while (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
+
+  const result = kept.join('\n').trimEnd();
+
+  if (!result.trim()) {
+    fs.unlinkSync(file);
+    return { ...base, action: 'deleted' };
+  }
+
+  fs.writeFileSync(file, result + '\n', 'utf8');
+  return { ...base, action: 'removed' };
+}
+
+function uninstallClient(client: ClientId, opts: UninstallOptions): UninstallEntry[] {
+  const spec = CLIENTS[client];
+  const useGlobal = opts.global || spec.projectPath === null;
+  const rel = useGlobal ? spec.globalPath : spec.projectPath;
+
+  const removeTarget = (target: string): UninstallEntry => {
+    const file = path.isAbsolute(target) ? target : path.join(opts.workspace, target);
+    return spec.toml
+      ? removeTomlClient(spec, file, opts)
+      : removeJsonClient(spec, file, opts);
+  };
+
+  const results: UninstallEntry[] = [];
+  if (rel) results.push(removeTarget(rel));
+
+  if (!opts.global) {
+    for (const extra of spec.extraProjectPaths ?? []) results.push(removeTarget(extra));
+  }
+  if (useGlobal || opts.global) {
+    for (const extra of spec.extraGlobalPaths ?? []) results.push(removeTarget(extra));
+  }
+  return results;
+}
+
+/** Strip the managed seer block from a context file (AGENTS.md, CLAUDE.md, GEMINI.md). */
+function removeContextFile(
+  fileName: string,
+  label: string,
+  opts: UninstallOptions,
+): UninstallEntry {
+  const file = path.join(opts.workspace, fileName);
+  const base: UninstallEntry = { label, file, action: 'skipped' };
+
+  if (!fs.existsSync(file)) return base;
+
+  const raw = fs.readFileSync(file, 'utf8');
+  const beginIdx = raw.indexOf(AGENTS_BEGIN);
+  const endIdx = raw.indexOf(AGENTS_END);
+  if (beginIdx === -1 || endIdx === -1) return base;
+
+  if (opts.print) return { ...base, action: 'removed' };
+
+  // Splice out the block including both markers and any surrounding blank lines
+  // we added as separators. We want to leave the file clean, not with orphan
+  // blank lines where the block used to be.
+  const before = raw.slice(0, beginIdx).replace(/\n{2,}$/, '\n').trimEnd();
+  const after  = raw.slice(endIdx + AGENTS_END.length).replace(/^\n{1,2}/, '');
+  const result = (before + (before && after ? '\n' : '') + after).trimEnd();
+
+  if (!result.trim()) {
+    fs.unlinkSync(file);
+    return { ...base, action: 'deleted' };
+  }
+
+  fs.writeFileSync(file, result + '\n', 'utf8');
+  return { ...base, action: 'removed' };
+}
+
+export function runUninstall(opts: UninstallOptions): UninstallResult {
+  const workspace = path.resolve(opts.workspace);
+  const clients = (opts.clients && opts.clients.length ? opts.clients : [...ALL_CLIENTS])
+    .filter((c) => ALL_CLIENTS.includes(c));
+
+  const entries = clients.flatMap((c) => uninstallClient(c, { ...opts, workspace }));
+
+  const contextFiles: UninstallEntry[] = [];
+  if (opts.agents !== false) {
+    contextFiles.push(removeContextFile('AGENTS.md', 'AGENTS.md (agent guide)', { ...opts, workspace }));
+    contextFiles.push(removeContextFile('CLAUDE.md', 'CLAUDE.md (Claude guide)', { ...opts, workspace }));
+    contextFiles.push(removeContextFile('GEMINI.md', 'GEMINI.md (Gemini guide)', { ...opts, workspace }));
+  }
+
+  return { entries, contextFiles };
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 export function runInit(opts: InitOptions): InitResult {
