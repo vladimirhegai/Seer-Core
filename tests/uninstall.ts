@@ -28,7 +28,7 @@ function freshWs(tag: string): string {
   return ws;
 }
 
-const PROJECT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini'];
+const PROJECT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity'];
 
 function main(): void {
   console.log('\nSeer Uninstall Tests\n====================\n');
@@ -56,10 +56,12 @@ function main(): void {
     check(!fs.existsSync(path.join(ws, '.codex', 'config.toml')), '1.codex config.toml deleted');
     // .gemini/settings.json same.
     check(!fs.existsSync(path.join(ws, '.gemini', 'settings.json')), '1.gemini settings.json deleted');
+    check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')), '1.antigravity workspace mcp_config.json deleted');
     check(!fs.existsSync(path.join(ws, '.cursor')), '1.empty .cursor directory pruned');
     check(!fs.existsSync(path.join(ws, '.vscode')), '1.empty .vscode directory pruned');
     check(!fs.existsSync(path.join(ws, '.codex')), '1.empty .codex directory pruned');
     check(!fs.existsSync(path.join(ws, '.gemini')), '1.empty .gemini directory pruned');
+    check(!fs.existsSync(path.join(ws, '.agents')), '1.empty .agents directory pruned');
 
     // Context files: AGENTS.md, CLAUDE.md, GEMINI.md all stripped.
     const cfActed = r.contextFiles.filter((e) => e.action !== 'skipped');
@@ -163,7 +165,7 @@ function main(): void {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
-  // ── 7. Antigravity: project + extra global paths all targeted ─────────────
+  // ── 7. Antigravity: workspace-local config is targeted ───────────────────
   {
     const ws = freshWs('antigravity');
     // Write a seer entry at the project-local extra path (.agents/mcp_config.json).
@@ -194,6 +196,19 @@ function main(): void {
     check(!fs.existsSync(path.join(ws, '.mcp.json')), '8.MCP config removed');
     check(fs.existsSync(path.join(ws, 'AGENTS.md')), '8.AGENTS.md left alone with --no-agents');
     check(fs.existsSync(path.join(ws, 'CLAUDE.md')), '8.CLAUDE.md left alone with --no-agents');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 9. --global only targets user-level config, not repo guidance ─────────
+  {
+    const ws = freshWs('global-noagents');
+    runInit({ workspace: ws, clients: ['claude'] });
+
+    runUninstall({ workspace: ws, clients: ['antigravity'], global: true, force: true });
+
+    check(fs.existsSync(path.join(ws, 'AGENTS.md')), '9.--global leaves AGENTS.md alone');
+    check(fs.existsSync(path.join(ws, 'CLAUDE.md')), '9.--global leaves CLAUDE.md alone');
 
     fs.rmSync(ws, { recursive: true, force: true });
   }

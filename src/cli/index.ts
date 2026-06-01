@@ -9,7 +9,7 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.9';
+const VERSION = '0.1.10';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
@@ -26,7 +26,12 @@ function parseClientList(raw: string | undefined): ClientId[] | undefined {
 }
 
 function resolveDb(repoPath: string, customDb?: string): string {
-  if (customDb) return path.resolve(customDb);
+  if (customDb) {
+    const resolved = path.resolve(customDb);
+    const dir = path.dirname(resolved);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return resolved;
+  }
   const seerDir = path.join(path.resolve(repoPath), '.seer');
   if (!fs.existsSync(seerDir)) fs.mkdirSync(seerDir, { recursive: true });
   return path.join(seerDir, 'graph.db');
@@ -124,7 +129,7 @@ program
   .description('Wire Seer in as an MCP server for your AI agents and write guidance files')
   .option('--db <path>', 'Custom database path passed through to the MCP launcher')
   .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (default: project-local clients)')
-  .option('--auto', 'Project-local setup plus detected editor-global clients (Antigravity/Windsurf)')
+  .option('--auto', 'Workspace-local setup for supported clients; no user-level/global config')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
   .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-mcp')

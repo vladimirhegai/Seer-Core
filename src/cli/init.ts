@@ -28,7 +28,7 @@ export type ClientId =
 export interface InitOptions {
   workspace: string;
   clients?: ClientId[];   // explicit subset; default = the project-local set
-  auto?: boolean;          // include detected editor-global clients
+  auto?: boolean;          // workspace-local setup; user-level clients stay opt-in
   global?: boolean;       // write user-level config instead of project-local
   command?: string;       // override the launch command line entirely
   npx?: boolean;          // emit the portable `npx -y <pkg> mcp` launcher
@@ -56,8 +56,8 @@ interface LaunchSpec {
 const ALL_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
 /** The default set when the user does not name clients: everything that has a
- *  clean project-local config. User-level-only clients are opt-in. */
-const DEFAULT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini'];
+ *  clean project/workspace-local config. User-level-only clients are opt-in. */
+const DEFAULT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity'];
 
 const DEFAULT_PKG = 'seer-mcp';
 const AGENTS_BEGIN = '<!-- seer:begin -->';
@@ -184,11 +184,6 @@ function home(...p: string[]): string {
   return path.join(os.homedir(), ...p);
 }
 
-function localAppData(...p: string[]): string | null {
-  const base = process.env.LOCALAPPDATA;
-  return base ? path.join(base, ...p) : null;
-}
-
 const CLIENTS: Record<ClientId, ClientSpec> = {
   claude: {
     label: 'Claude Code',
@@ -224,9 +219,8 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
   },
   antigravity: {
     label: 'Google Antigravity',
-    projectPath: null,
+    projectPath: path.join('.agents', 'mcp_config.json'),
     globalPath: home('.gemini', 'antigravity', 'mcp_config.json'),
-    extraProjectPaths: [path.join('.agents', 'mcp_config.json')],
     extraGlobalPaths: [
       home('.gemini', 'antigravity-cli', 'mcp_config.json'),
       home('.gemini', 'config', 'mcp_config.json'),
@@ -291,49 +285,10 @@ function clientTargets(client: ClientId, workspace: string, scope: 'init' | 'all
   return targets;
 }
 
-function pathExistsAny(paths: Array<string | null | undefined>): boolean {
-  return paths.some((p) => !!p && fs.existsSync(p));
-}
-
-function commandExists(names: string[]): boolean {
-  const pathValue = process.env.PATH;
-  if (!pathValue) return false;
-  const dirs = pathValue.split(path.delimiter).filter(Boolean);
-  const extensions = process.platform === 'win32'
-    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')
-    : [''];
-  for (const dir of dirs) {
-    for (const name of names) {
-      for (const ext of extensions) {
-        if (fs.existsSync(path.join(dir, name + ext))) return true;
-      }
-    }
-  }
-  return false;
-}
-
-export function detectAutoClients(workspace: string): ClientId[] {
+export function detectAutoClients(_workspace: string): ClientId[] {
   const selected = new Set<ClientId>(DEFAULT_CLIENTS);
-  const antigravityApp = localAppData('Programs', 'Antigravity IDE');
-  if (pathExistsAny([
-    home('.gemini', 'antigravity'),
-    home('.gemini', 'antigravity-cli'),
-    home('.gemini', 'antigravity-ide'),
-    path.join(workspace, '.agents'),
-    antigravityApp,
-    '/Applications/Antigravity.app',
-    '/Applications/Antigravity IDE.app',
-    '/opt/antigravity',
-    '/opt/antigravity-ide',
-  ]) || commandExists(['agy', 'antigravity', 'antigravity-ide'])) {
-    selected.add('antigravity');
-  }
-  if (pathExistsAny([
-    home('.codeium', 'windsurf'),
-    home('.windsurf'),
-  ]) || commandExists(['windsurf'])) {
-    selected.add('windsurf');
-  }
+  // `--auto` is intentionally workspace-local. Do not add user-level-only
+  // clients here; they can shadow other repos and need explicit opt-in.
   return ALL_CLIENTS.filter((c) => selected.has(c));
 }
 
@@ -854,7 +809,7 @@ export function runUninstall(opts: UninstallOptions): UninstallResult {
   const entries = clients.flatMap((c) => uninstallClient(c, { ...opts, workspace }));
 
   const contextFiles: UninstallEntry[] = [];
-  if (opts.agents !== false) {
+  if (opts.agents !== false && !opts.global) {
     contextFiles.push(removeContextFile('AGENTS.md', 'AGENTS.md (agent guide)', { ...opts, workspace }));
     contextFiles.push(removeContextFile('CLAUDE.md', 'CLAUDE.md (Claude guide)', { ...opts, workspace }));
     contextFiles.push(removeContextFile('GEMINI.md', 'GEMINI.md (Gemini guide)', { ...opts, workspace }));

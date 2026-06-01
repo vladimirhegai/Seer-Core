@@ -216,6 +216,12 @@ async function deepCliDbLookup(): Promise<void> {
       encoding: 'utf8',
     });
     check(stats.status === 0 && stats.stdout.includes('Seer Index Stats'), 'CLI finds .seer/graph.db more than six levels up', stats.stderr || stats.stdout);
+
+    const customDb = path.join(root, 'nested', '.seer', 'custom.db');
+    const custom = spawnSync(process.execPath, [path.join(__dirname, '..', 'dist', 'cli', 'index.js'), 'index', root, '--db', customDb, '--reset', '--no-parallel'], {
+      encoding: 'utf8',
+    });
+    check(custom.status === 0 && fs.existsSync(customDb), 'CLI creates parent directories for custom --db path', custom.stderr || custom.stdout);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -232,13 +238,14 @@ function globalNpxLaunchersCarryWorkspace(): void {
     const windsurf = runInit({ workspace: ws, clients: ['windsurf'], npx: true, print: true });
     const windsurfSnippet = windsurf.entries[0].snippet ?? '';
     const windsurfArgs = JSON.parse(windsurfSnippet).mcpServers.seer.args as string[];
-    check(windsurfArgs.includes('--workspace') && windsurfArgs.includes(ws), 'global Windsurf npx launcher pins workspace', windsurfArgs);
+    check(windsurfArgs.includes('--workspace') && windsurfArgs.includes(ws), 'user-level-only Windsurf npx launcher pins workspace', windsurfArgs);
 
     const ag = runInit({ workspace: ws, clients: ['antigravity'], npx: true, print: true });
-    const globalEntries = ag.entries.filter(e => path.isAbsolute(e.file) && !e.file.startsWith(ws));
     const projectEntry = ag.entries.find(e => e.file.endsWith(path.join('.agents', 'mcp_config.json')));
-    check(globalEntries.every(e => (e.snippet ?? '').includes('--workspace')), 'global Antigravity entries pin workspace', globalEntries.map(e => e.snippet));
-    check(Boolean(projectEntry && !(projectEntry.snippet ?? '').includes('--workspace')), 'Antigravity workspace-local entry stays portable', projectEntry?.snippet);
+    const agGlobal = runInit({ workspace: ws, clients: ['antigravity'], npx: true, global: true, print: true });
+    const globalEntries = agGlobal.entries.filter(e => path.isAbsolute(e.file) && !e.file.startsWith(ws));
+    check(Boolean(projectEntry && !(projectEntry.snippet ?? '').includes('--workspace')), 'Antigravity default stays workspace-local and portable', projectEntry?.snippet);
+    check(globalEntries.every(e => (e.snippet ?? '').includes('--workspace')), 'Antigravity --global entries pin workspace', globalEntries.map(e => e.snippet));
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
   }

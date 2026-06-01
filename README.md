@@ -51,26 +51,27 @@ From another directory, pass the repo path:
 npx seer-mcp init C:\path\to\repo --auto
 ```
 
-Use this when you want Seer set up for your normal agent/editor. It writes
-repo-local MCP config where possible, and detected editor-wide config for tools
-like Antigravity. Editor-wide configs are pinned to this repo with
-`--workspace`.
+Use this when you want Seer set up for the current repo. It writes
+workspace-local MCP config only. If you have Project A and Project B, run the
+same command in each repo; both keep their own Seer config and index.
 
 Common installs:
 
 ```bash
 npx seer-mcp init --auto                 # recommended
-npx seer-mcp init                        # repo-local only, no editor-wide files
+npx seer-mcp init                        # same workspace-local default
 npx seer-mcp init --client antigravity   # Antigravity IDE / CLI
 npx seer-mcp init --client claude        # Claude Code CLI
+npx seer-mcp init --client windsurf      # Windsurf user config, pinned here
 npx seer-mcp init --client codex         # Codex only
-npx seer-mcp init --client all           # every supported client
+npx seer-mcp init --client all           # all clients, including Windsurf user config
 ```
 
 Useful flags:
 
-- `--auto`: repo-local setup plus detected editor-wide clients.
+- `--auto`: workspace-local setup; no global editor files.
 - `--client <name>`: target one client, or use `all`.
+- `--global`: write user-level config for clients that support it.
 - `--print`: preview files before writing.
 - `--force`: replace an existing `seer` entry.
 

@@ -22,7 +22,7 @@ const bad = (m: string, x?: unknown): void => {
 };
 const check = (c: boolean, m: string, x?: unknown): void => { c ? ok(m) : bad(m, x); };
 
-const PROJECT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini'];
+const PROJECT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity'];
 
 function freshWs(tag: string): string {
   const ws = path.join(os.tmpdir(), `seer-init-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -56,6 +56,9 @@ function main(): void {
     const gemini = JSON.parse(fs.readFileSync(path.join(ws, '.gemini', 'settings.json'), 'utf8'));
     check(!!gemini.mcpServers?.seer, '1.gemini .gemini/settings.json has mcpServers.seer');
 
+    const ag = JSON.parse(fs.readFileSync(path.join(ws, '.agents', 'mcp_config.json'), 'utf8'));
+    check(!!ag.mcpServers?.seer, '1.antigravity .agents/mcp_config.json has mcpServers.seer');
+
     const toml = fs.readFileSync(path.join(ws, '.codex', 'config.toml'), 'utf8');
     check(/\[mcp_servers\.seer\]/.test(toml), '1.codex config.toml has [mcp_servers.seer]');
     check(/command = "node"/.test(toml), '1.codex block has command = "node"');
@@ -82,19 +85,30 @@ function main(): void {
   }
 
   {
-    const ws = freshWs('user-level-print');
-    const r = runInit({ workspace: ws, clients: ['antigravity', 'windsurf'], print: true });
+    const ws = freshWs('antigravity-workspace-print');
+    const r = runInit({ workspace: ws, clients: ['antigravity'], print: true });
     const files = r.entries.map((e) => e.file.replace(/\\/g, '/'));
-    check(files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
-      '6b.antigravity current IDE config planned', files);
-    check(files.some((f) => f.endsWith('/.gemini/antigravity-cli/mcp_config.json')),
-      '6b.antigravity CLI config planned', files);
     check(files.some((f) => f.endsWith('/.agents/mcp_config.json')),
       '6b.antigravity workspace config planned', files);
-    check(files.some((f) => f.endsWith('/.codeium/windsurf/mcp_config.json')),
-      '6b.windsurf config planned', files);
+    check(!files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
+      '6b.antigravity default does not plan user-level config', files);
     check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
       '6b.--print does not write antigravity workspace config');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('user-level-print');
+    const r = runInit({ workspace: ws, clients: ['antigravity', 'windsurf'], global: true, print: true });
+    const files = r.entries.map((e) => e.file.replace(/\\/g, '/'));
+    check(files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
+      '6c.antigravity current IDE global config planned with --global', files);
+    check(files.some((f) => f.endsWith('/.gemini/antigravity-cli/mcp_config.json')),
+      '6c.antigravity CLI global config planned with --global', files);
+    check(files.some((f) => f.endsWith('/.codeium/windsurf/mcp_config.json')),
+      '6c.windsurf config planned with --global', files);
+    check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
+      '6c.--global --print does not write antigravity workspace config');
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
@@ -171,6 +185,7 @@ function main(): void {
     check(!fs.existsSync(path.join(ws, 'AGENTS.md')), '6.--print does not write AGENTS.md');
     check(!fs.existsSync(path.join(ws, 'CLAUDE.md')), '6.--print does not write CLAUDE.md');
     check(!fs.existsSync(path.join(ws, 'GEMINI.md')), '6.--print does not write GEMINI.md');
+    check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')), '6.--print does not write .agents/mcp_config.json');
     check(r.entries.length === PROJECT_CLIENTS.length, '6.--print still returns a full plan');
     check(r.entries.every((e) => !!e.snippet), '6.--print plan carries snippets to preview');
     fs.rmSync(ws, { recursive: true, force: true });

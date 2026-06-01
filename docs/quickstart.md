@@ -5,10 +5,8 @@ want your agent to understand.
 
 Requirements: Node.js 24+ on Windows, macOS, or Linux.
 
-Seer supports both editor and CLI agents. Claude Code CLI uses the Claude
-project MCP file. Antigravity CLI uses its Antigravity CLI MCP file. Codex CLI,
-Gemini CLI, Cursor, VS Code, Antigravity IDE, and Windsurf use the files shown
-below.
+Seer supports both editor and CLI agents. The default install is
+workspace-specific: run it once per repo you want agents to understand.
 
 ## Install
 
@@ -24,9 +22,21 @@ From another directory:
 npx seer-mcp init C:\path\to\repo --auto
 ```
 
-This writes repo-local config for clients that support it and detected
-editor-wide config for clients such as Antigravity. Editor-wide config is
-pinned to the current repo with `--workspace`.
+This writes workspace-local config only. It does not rewrite Antigravity,
+Cursor, Claude, Codex, or Gemini user-level config.
+
+Example:
+
+```bash
+cd ProjectA
+npx seer-mcp init --auto
+
+cd ../ProjectB
+npx seer-mcp init --auto
+```
+
+Project A and Project B now both have Seer. No re-pointing is needed when the
+agent loads each repo's local MCP config.
 
 Use a narrower command when you know the client:
 
@@ -40,9 +50,18 @@ Use a narrower command when you know the client:
 | Gemini CLI | `npx seer-mcp init --client gemini` |
 | Windsurf | `npx seer-mcp init --client windsurf` |
 | Everything supported | `npx seer-mcp init --client all` |
-| Repo-local defaults only | `npx seer-mcp init` |
+| Workspace-local defaults only | `npx seer-mcp init` |
 
 Use `--force` if you intentionally want to replace an existing `seer` entry.
+
+Use `--global` only when you want Seer in a user-level config file:
+
+```bash
+npx seer-mcp init --client antigravity --global --force
+```
+
+Global/user-level entries include `--workspace <repo>` because they do not
+belong to one project folder.
 
 ## Verify
 
@@ -104,7 +123,7 @@ Resources/**
 `CLAUDE.md` and `GEMINI.md` are small imports to `AGENTS.md`; Seer does not
 duplicate the full instruction block there.
 
-For editor-wide clients, `init` may also write user config:
+For user-level clients, `init --global` or a user-level-only client may write:
 
 | Client | User-level file |
 |---|---|
@@ -113,20 +132,34 @@ For editor-wide clients, `init` may also write user config:
 | Antigravity compatibility paths | `~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity-ide/mcp_config.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
-Editor-wide files include `--workspace <repo>`.
+User-level files include `--workspace <repo>`.
 
 ## Workspace-Specific Behavior
 
-Repo-local config follows the repo. If your agent opens a different repo, that
-repo needs its own install.
+Workspace-local config follows the repo. If your agent opens a different repo,
+that repo needs its own install.
 
-Editor-wide config, such as Antigravity and Windsurf, lives in your user
-profile. It can only have one `seer` entry, so it points to one repo at a time.
-To move that editor-wide `seer` entry to another repo, run from the new repo:
+This is the normal flow for:
+
+| Client | Default Seer scope |
+|---|---|
+| Antigravity IDE / CLI | Workspace-local `.agents/mcp_config.json` |
+| Claude Code CLI | Workspace-local `.mcp.json` |
+| Cursor | Workspace-local `.cursor/mcp.json` |
+| VS Code native MCP / Copilot | Workspace-local `.vscode/mcp.json` |
+| Codex CLI / extension | Workspace-local `.codex/config.toml` |
+| Gemini CLI | Workspace-local `.gemini/settings.json` |
+| Windsurf | User-level only, pinned with `--workspace` |
+
+Windsurf is the exception because its documented MCP file is user-level. Seer
+pins that entry to the repo you installed from:
 
 ```bash
-npx seer-mcp init --auto --force
+npx seer-mcp init --client windsurf --force
 ```
+
+If a user-level entry points to the wrong repo, `seer_health` will show it.
+Re-run the explicit command from the repo you want active.
 
 ## Update
 
@@ -151,7 +184,7 @@ Useful update flags:
 |---|---|
 | `--client all` | Refresh all known client entries that already exist. |
 | `--global` | Only refresh user-level configs. |
-| `--force` | Re-point an editor-wide Seer entry pinned to another repo. |
+| `--force` | Re-point a user-level Seer entry pinned to another repo. |
 | `--print` | Show the plan without writing files. |
 
 ## Uninstall
@@ -180,8 +213,10 @@ Useful uninstall flags:
 | `--client antigravity` | Remove only one client. |
 | `--global` | Only remove user-level config entries. |
 | `--no-agents` | Leave `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` alone. |
-| `--force` | Remove editor-wide entries even if pinned to another repo. |
+| `--force` | Remove user-level entries even if pinned to another repo. |
 | `--print` | Dry run. |
+
+`--global` does not touch repo guidance files.
 
 ## Common Fixes
 
@@ -202,3 +237,20 @@ Need to see exactly what would change:
 ```bash
 npx seer-mcp init --auto --print
 ```
+
+Codex does not show Seer:
+
+```bash
+npx seer-mcp init --client codex --global --force
+```
+
+Some Codex versions only load project-local `.codex/config.toml` for trusted
+projects. The global fallback uses `~/.codex/config.toml`.
+
+Antigravity IDE does not show Seer:
+
+```bash
+npx seer-mcp init --client antigravity --global --force
+```
+
+This writes Antigravity's user-level MCP file and pins it to the current repo.
