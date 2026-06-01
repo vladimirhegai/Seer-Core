@@ -39,7 +39,7 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 ## Quick Start
 
 Run from the repo you want Seer to index. Requires Node.js 24+ on Windows,
-macOS, or Linux.
+macOS, or Linux. Seer is designed to be as easy to install as possible.
 
 ```bash
 npx seer-mcp init --auto
