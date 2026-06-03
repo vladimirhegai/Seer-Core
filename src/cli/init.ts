@@ -638,7 +638,7 @@ function agentsBlock(): string {
     '1. Call `seer_health` once and confirm `workspace` is this repo.',
     '2. If `seer_health.workspace` is not this repo, stop using Seer for this',
     '   task and tell the user to restart/reload the agent after running',
-    '   `npx seer-mcp init --auto --force` in this repo.',
+    '   `npx seer-mcp init --yes --force` in this repo.',
     '3. If `seer_health` is unavailable or times out, report that the MCP',
     '   session is stale/unavailable; do not inspect Seer config or use stale results.',
     '4. If you know the target symbol, call `seer_context { symbol }` or',

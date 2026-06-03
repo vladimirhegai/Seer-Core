@@ -4,21 +4,25 @@ This page is the exact MCP configuration reference. For normal use, run setup
 from the repo you want Seer to index:
 
 ```bash
-npx seer-mcp init --auto
+npx seer-mcp init
 ```
 
+This launches an interactive wizard that asks which agent(s) to configure and
+whether to index now. It writes workspace-local config only — into the current
+repo, never into user-level/global MCP files unless you ask for `--global`.
 Then restart/reload your agent and ask it to call `seer_health`.
 
 Seer supports Windows, macOS, and Linux. In paths below, `~` means your user
 home directory (`%USERPROFILE%` on Windows).
 
-`--auto` is workspace-local. It writes config into the current repo and avoids
-user-level/global MCP files.
-
 ## Pick A Client
+
+The wizard handles client selection for you. To skip it (scripts, CI, or when
+you already know the client), use `--yes` or name the client:
 
 | You use | Command |
 |---|---|
+| Detected client, no prompts | `npx seer-mcp init --yes` |
 | Antigravity IDE / CLI | `npx seer-mcp init --client antigravity` |
 | Claude Code CLI | `npx seer-mcp init --client claude` |
 | Cursor | `npx seer-mcp init --client cursor` |
@@ -27,19 +31,15 @@ user-level/global MCP files.
 | Gemini CLI | `npx seer-mcp init --client gemini` |
 | Windsurf user config | `npx seer-mcp init --client windsurf` |
 | Everything supported, including Windsurf user config | `npx seer-mcp init --client all` |
-| Workspace-local setup | `npx seer-mcp init --auto` |
-| Workspace-local defaults only | `npx seer-mcp init` |
 
 Use `--print` to preview changes and `--force` to replace an existing `seer`
-entry.
-
-`--client all` includes user-level-only clients such as Windsurf. Use `--auto`
-when you want the workspace-local default set only.
+entry. `--client` and `--yes` both skip the wizard. `--client all` includes
+user-level-only clients such as Windsurf.
 
 All `init`, `update`, and `uninstall` commands accept an optional workspace path:
 
 ```bash
-npx seer-mcp init C:\path\to\repo --auto
+npx seer-mcp init C:\path\to\repo
 ```
 
 ## Workspace Rule
@@ -69,7 +69,7 @@ active repo, the agent is using a stale/mispointed MCP process. Rerun setup from
 the repo:
 
 ```bash
-npx seer-mcp init --auto --force
+npx seer-mcp init --yes --force
 ```
 
 Then restart/reload the agent. Do not trust Seer query results until

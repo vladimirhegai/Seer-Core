@@ -12,6 +12,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { runInit, runUpdate, detectAutoClients, ClientId } from '../src/cli/init';
+import { parseSelection, runInitWizard, PromptIO } from '../src/cli/prompt';
 
 let passed = 0;
 let failed = 0;
@@ -47,7 +48,13 @@ function withEnv(name: string, value: string, fn: () => void): void {
   }
 }
 
-function main(): void {
+/** A scripted PromptIO that replays canned answers, in order, for the wizard. */
+function scriptedIO(answers: string[]): PromptIO {
+  let i = 0;
+  return { question: async () => answers[i++] ?? '', log: () => {} };
+}
+
+async function main(): Promise<void> {
   console.log('\nSeer Init Tests\n===============\n');
 
   // ── 1. Fresh write across all project-local clients ───────────────────────
@@ -318,6 +325,44 @@ function main(): void {
     check(gem.includes('@AGENTS.md') && !gem.includes('old duplicated'),
       '9.update converts GEMINI.md duplicate guidance to import shim', gem);
     fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 10. Wizard selection parser (the interactive --auto path) ─────────────
+  {
+    const menu = ['a', 'b', 'c', 'd'];
+    const join = (xs: string[]) => xs.join('');
+    check(join(parseSelection('1,3', menu)) === 'ac', '10.parses "1,3" to the 1st and 3rd items');
+    check(join(parseSelection('1 3', menu)) === 'ac', '10.tolerates space-separated numbers');
+    check(join(parseSelection('3,1,1', menu)) === 'ac', '10.dedupes and sorts ascending');
+    check(parseSelection('9', menu).length === 0, '10.ignores out-of-range numbers');
+    check(parseSelection('', menu).length === 0, '10.empty input selects nothing');
+    check(join(parseSelection('2,abc,4', menu)) === 'bd', '10.ignores non-numeric tokens');
+  }
+
+  // ── 11. Wizard branching with scripted answers (no TTY needed) ────────────
+  {
+    // Antigravity detected, accept default (Enter), no extensions, index Y, history N.
+    const a = await runInitWizard(['antigravity'], scriptedIO(['', '', '', '']));
+    check(!!a && a.clients.join(',') === 'antigravity', '11.empty client answer accepts the detected default', a);
+    check(!!a && a.index === true, '11.index defaults to yes on Enter', a);
+    check(!!a && a.symbolHistory === false, '11.symbol history defaults to no on Enter', a);
+
+    // Pick Antigravity (1) + two extensions (Claude=1, Gemini=3), decline index.
+    const b = await runInitWizard([], scriptedIO(['1', '1,3', 'n']));
+    check(!!b && b.clients.includes('antigravity') && b.clients.includes('claude') && b.clients.includes('gemini'),
+      '11.antigravity + chosen extensions are all configured', b?.clients);
+    check(!!b && b.clients.includes('codex') === false, '11.unpicked extension is not added', b?.clients);
+    check(!!b && b.index === false, '11.declining index returns index=false', b);
+    check(!!b && b.symbolHistory === false, '11.history is skipped entirely when not indexing', b);
+
+    // Multi-select non-antigravity clients; no extension prompt should consume input.
+    const c = await runInitWizard([], scriptedIO(['2,4', 'y', 'y']));
+    check(!!c && c.clients.join(',') === 'claude,cursor', '11.multi-select maps numbers to the right clients', c?.clients);
+    check(!!c && c.index === true && c.symbolHistory === true, '11.index=yes then history=yes both honored', c);
+
+    // Empty/garbage client selection bails out with null.
+    const d = await runInitWizard([], scriptedIO(['99']));
+    check(d === null, '11.out-of-range-only client selection bails out (null)', d);
   }
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);

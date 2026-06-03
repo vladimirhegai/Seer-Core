@@ -38,67 +38,69 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 ## Quick Start
 
-Run from the repo you want Seer to index. Requires Node.js 24+ on Windows,
-macOS, or Linux. Seer is designed to be as easy to install as possible.
+From the repo you want Seer to understand, run:
 
 ```bash
-npx seer-mcp init --auto
+npx seer-mcp init
 ```
 
-From another directory, pass the repo path:
+Requires Node.js 24+ on Windows, macOS, or Linux.
+
+That starts a short interactive setup that asks you three things and does the
+rest:
+
+1. **Which AI agent(s)** you use (Antigravity, Claude Code, Codex, Cursor,
+   Gemini, VS Code, Windsurf). It pre-selects the one it detects, so usually you
+   just press Enter. If you pick Antigravity, it also offers to wire up any
+   Claude / Codex / Gemini extensions you run inside it.
+2. **Index now?** — recommended. Builds the local map so the first agent query
+   is instant.
+3. **Index git history too?** — optional, off by default (slow on large repos).
+
+It only writes config for the agents you choose — picking Antigravity will
+never scribble `.cursor/` or `.vscode/` into your repo.
+
+When you're done, restart/reload your agent and ask it to call `seer_health` to
+confirm it's connected.
+
+### Non-interactive / scripted
+
+Skip the prompts with `--yes`, or name the client directly:
 
 ```bash
-npx seer-mcp init C:\path\to\repo --auto
+npx seer-mcp init --yes                   # accept detected defaults, no prompts
+npx seer-mcp init --client antigravity    # Antigravity IDE / CLI
+npx seer-mcp init --client claude         # Claude Code
+npx seer-mcp init --client codex          # Codex
+npx seer-mcp init --client cursor         # Cursor
+npx seer-mcp init --client vscode         # VS Code (Copilot / native MCP)
+npx seer-mcp init --client gemini         # Gemini CLI
+npx seer-mcp init --client windsurf       # Windsurf (user-level, pinned here)
+npx seer-mcp init --client all            # every supported client
 ```
 
-Use this when you want Seer set up for the current repo. It writes
-workspace-local MCP config only. If you have Project A and Project B, run the
-same command in each repo; both keep their own Seer config and index.
-Antigravity's repo-local config includes `--workspace` because the IDE can
-launch MCP from the Antigravity install directory. Its server id is also
-workspace-specific, such as `seer_godot_a1b2c3d4`, so two Antigravity projects
-do not fight over one cached `seer` process.
-
-Common installs:
-
-```bash
-npx seer-mcp init --auto                 # recommended
-npx seer-mcp init                        # same workspace-local default
-npx seer-mcp init --client antigravity   # Antigravity IDE / CLI
-npx seer-mcp init --client claude        # Claude Code CLI
-npx seer-mcp init --client windsurf      # Windsurf user config, pinned here
-npx seer-mcp init --client codex         # Codex only
-npx seer-mcp init --client all           # all clients; also writes Windsurf user config
-```
+From another directory, pass the repo path first: `npx seer-mcp init C:\path\to\repo`.
 
 Useful flags:
 
-- `--auto`: workspace-local setup; no global editor files.
-- `--client <name>`: target one client. `all` includes user-level clients such as Windsurf.
+- `--yes`: skip the wizard; accept the detected client and defaults.
+- `--client <name>`: target one client (skips the wizard).
 - `--global`: write user-level config for clients that support it.
-- `--print`: preview files before writing.
+- `--print`: preview every file change without writing.
 - `--force`: replace an existing `seer` / `seer_<workspace>` entry.
 
-Build the local index now:
+### Per-repo by design
 
-```bash
-npx seer-mcp index .
-```
+Seer maps one repo at a time, so config is workspace-local. Run setup once in
+each repo; Project A and Project B each keep their own config and index, with no
+re-pointing. Antigravity gets a workspace-specific server id (such as
+`seer_godot_a1b2c3d4`) so two projects never share one cached `seer` process.
 
-Then restart/reload your agent and ask it to call:
+The index lives at `<repo>/.seer/graph.db` — add `.seer/` to `.gitignore`. If
+you skip indexing during setup, Seer builds it on the first query. To rebuild
+later, or to install without the wizard, run `npx seer-mcp index .`.
 
-```text
-seer_health
-```
-
-The index lives at `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore` if
-it is not already ignored. If you skip `index .`, Seer builds the index on the
-first query.
-Claude Code gets Seer's core MCP tools marked as always-load. Antigravity has
-no eager flag; Seer relies on workspace-local config, `--workspace`/`cwd`, and
-standard MCP read-only annotations for query tools.
-
-Update existing installs:
+Already installed? Refresh an existing setup after upgrading Seer:
 
 ```bash
 npx seer-mcp update

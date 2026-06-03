@@ -8,6 +8,7 @@ import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
+import { runInitWizard, isInteractive } from './prompt.js';
 
 // Read the version from package.json at runtime so it never drifts from the
 // published release the way a hardcoded literal does. `__dirname` resolves to
@@ -94,83 +95,130 @@ program
       fs.unlinkSync(dbPath);
       console.log(`  Removed existing index: ${dbPath}`);
     }
-    console.log(`\nSeer Index`);
-    console.log(`  Repo:  ${absRepo}`);
-    console.log(`  DB:    ${dbPath}\n`);
-    const store = new Store(dbPath);
-    const indexer = new Indexer(store);
-    try {
-      const maxKb = parseInt(opts.maxFileKb, 10);
-      const maxFileBytes = isNaN(maxKb) || maxKb <= 0 ? 0 : maxKb * 1024;
-      const mode = parseMode(opts.mode);
-      // `--parallel` / `--no-parallel` force the parser mode; otherwise the
-      // indexer uses auto mode (workers for normal/large repos, serial for tiny).
-      const jobsN = opts.jobs ? parseInt(opts.jobs, 10) : undefined;
-      const result = await indexer.indexDirectory(absRepo, {
-        verbose: opts.verbose,
-        reset: opts.reset,
-        maxFileBytes,
-        includeVendor: opts.includeVendor,
-        includeGenerated: opts.includeGenerated,
-        mode,
-        parallel: opts.parallel,
-        jobs: jobsN != null && !isNaN(jobsN) && jobsN > 0 ? jobsN : undefined,
-      });
-      console.log(`\n   Indexed ${result.filesIndexed.toLocaleString()} files`);
-      if (result.filesReusedFromCache > 0) console.log(`    ${result.filesReusedFromCache.toLocaleString()} reused from cache`);
-      if (result.filesSkipped > 0)         console.log(`    ${result.filesSkipped.toLocaleString()} skipped`);
-      if (result.filesSkippedTooLarge > 0) console.log(`    ${result.filesSkippedTooLarge.toLocaleString()} skipped (too large)`);
-      if (result.filesParseError > 0)      console.log(`    ${result.filesParseError.toLocaleString()} parse errors`);
-      if (result.wasmResets > 0)           console.log(`    ${result.wasmResets} WASM reset(s)`);
-      console.log(`   ${result.symbols.toLocaleString()} symbols`);
-      console.log(`   ${result.edges.toLocaleString()} edges (${result.resolvedEdges.toLocaleString()} resolved)`);
-      console.log(`   ${result.resolvedImports.toLocaleString()} imports resolved`);
-      if ((result.routesResolved ?? 0) > 0)      console.log(`   ${result.routesResolved} routes linked to handlers`);
-      if ((result.testEdgesAdded ?? 0) > 0)      console.log(`   ${result.testEdgesAdded} test edges synthesized`);
-      if ((result.externalDependencies ?? 0) > 0)console.log(`   ${result.externalDependencies} external deps`);
-      if (result.pagerankRecomputed) console.log(`   PageRank computed`);
-      else                            console.log(`   PageRank reused (graph unchanged)`);
-      console.log(`\n  Done in ${(result.elapsedMs / 1000).toFixed(1)}s`);
-
-      // Auto-update symbol history: ONLY when a history index already exists
-      // (the user opted in by building it before). Re-running buildSymbolHistory
-      // is incremental — files whose content is unchanged are resume-skipped, so
-      // after a `git pull` + index this just refreshes the handful of files that
-      // actually changed (their old rows were already cascade-cleared when their
-      // symbols were reindexed). Opt out with --no-history-refresh.
-      const histState = store.getGitIndexState();
-      if (opts.historyRefresh !== false && histState?.lastHistoryHeadSha) {
-        try {
-          const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
-          // Replicate the --follow choice from the last full build. This is
-          // stored authoritatively in git_index_state.last_history_follow (written
-          // by setHistoryHeadSha at full-build completion). Watermarks are NOT used
-          // here because scoped/partial builds can leave mixed follow=0/1 rows that
-          // make watermark-scanning non-deterministic.
-          const followFromState = histState.lastHistoryFollow ?? false;
-          process.stdout.write(`\n  Refreshing symbol history (incremental)...`);
-          const hr = await buildSymbolHistory(absRepo, store, {
-            follow: followFromState,
-            log: () => {},
-          });
-          if (hr.skipped) console.log(` up to date.`);
-          else console.log(` ${hr.historyRowsInserted} rows across ${hr.filesProcessed} changed file(s).`);
-        } catch (err) {
-          console.log(`\n  (symbol-history refresh skipped: ${(err as Error).message})`);
-        }
-      }
-    } finally {
-      store.close();
-    }
+    const maxKb = parseInt(opts.maxFileKb, 10);
+    const jobsN = opts.jobs ? parseInt(opts.jobs, 10) : undefined;
+    await performIndex(absRepo, dbPath, {
+      verbose: opts.verbose,
+      reset: opts.reset,
+      maxFileBytes: isNaN(maxKb) || maxKb <= 0 ? 0 : maxKb * 1024,
+      includeVendor: opts.includeVendor,
+      includeGenerated: opts.includeGenerated,
+      mode: parseMode(opts.mode),
+      parallel: opts.parallel,
+      jobs: jobsN != null && !isNaN(jobsN) && jobsN > 0 ? jobsN : undefined,
+      historyRefresh: opts.historyRefresh,
+    });
   });
+
+interface PerformIndexOpts {
+  verbose?: boolean;
+  reset?: boolean;
+  maxFileBytes?: number;
+  includeVendor?: boolean;
+  includeGenerated?: boolean;
+  mode?: 'full' | 'standard' | 'fast';
+  parallel?: boolean;
+  jobs?: number;
+  historyRefresh?: boolean;
+}
+
+/**
+ * Index a repo into its SQLite graph and print a human report. Shared by the
+ * `index` command and the interactive `init` wizard so both behave identically.
+ */
+async function performIndex(absRepo: string, dbPath: string, opts: PerformIndexOpts): Promise<void> {
+  console.log(`\nSeer Index`);
+  console.log(`  Repo:  ${absRepo}`);
+  console.log(`  DB:    ${dbPath}\n`);
+  const store = new Store(dbPath);
+  const indexer = new Indexer(store);
+  try {
+    const result = await indexer.indexDirectory(absRepo, {
+      verbose: opts.verbose,
+      reset: opts.reset,
+      maxFileBytes: opts.maxFileBytes ?? 0,
+      includeVendor: opts.includeVendor,
+      includeGenerated: opts.includeGenerated,
+      mode: opts.mode,
+      parallel: opts.parallel,
+      jobs: opts.jobs,
+    });
+    console.log(`\n   Indexed ${result.filesIndexed.toLocaleString()} files`);
+    if (result.filesReusedFromCache > 0) console.log(`    ${result.filesReusedFromCache.toLocaleString()} reused from cache`);
+    if (result.filesSkipped > 0)         console.log(`    ${result.filesSkipped.toLocaleString()} skipped`);
+    if (result.filesSkippedTooLarge > 0) console.log(`    ${result.filesSkippedTooLarge.toLocaleString()} skipped (too large)`);
+    if (result.filesParseError > 0)      console.log(`    ${result.filesParseError.toLocaleString()} parse errors`);
+    if (result.wasmResets > 0)           console.log(`    ${result.wasmResets} WASM reset(s)`);
+    console.log(`   ${result.symbols.toLocaleString()} symbols`);
+    console.log(`   ${result.edges.toLocaleString()} edges (${result.resolvedEdges.toLocaleString()} resolved)`);
+    console.log(`   ${result.resolvedImports.toLocaleString()} imports resolved`);
+    if ((result.routesResolved ?? 0) > 0)      console.log(`   ${result.routesResolved} routes linked to handlers`);
+    if ((result.testEdgesAdded ?? 0) > 0)      console.log(`   ${result.testEdgesAdded} test edges synthesized`);
+    if ((result.externalDependencies ?? 0) > 0)console.log(`   ${result.externalDependencies} external deps`);
+    if (result.pagerankRecomputed) console.log(`   PageRank computed`);
+    else                            console.log(`   PageRank reused (graph unchanged)`);
+    console.log(`\n  Done in ${(result.elapsedMs / 1000).toFixed(1)}s`);
+
+    // Auto-update symbol history: ONLY when a history index already exists
+    // (the user opted in by building it before). Re-running buildSymbolHistory
+    // is incremental — files whose content is unchanged are resume-skipped, so
+    // after a `git pull` + index this just refreshes the handful of files that
+    // actually changed (their old rows were already cascade-cleared when their
+    // symbols were reindexed). Opt out with --no-history-refresh.
+    const histState = store.getGitIndexState();
+    if (opts.historyRefresh !== false && histState?.lastHistoryHeadSha) {
+      try {
+        const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+        // Replicate the --follow choice from the last full build. This is
+        // stored authoritatively in git_index_state.last_history_follow (written
+        // by setHistoryHeadSha at full-build completion). Watermarks are NOT used
+        // here because scoped/partial builds can leave mixed follow=0/1 rows that
+        // make watermark-scanning non-deterministic.
+        const followFromState = histState.lastHistoryFollow ?? false;
+        process.stdout.write(`\n  Refreshing symbol history (incremental)...`);
+        const hr = await buildSymbolHistory(absRepo, store, {
+          follow: followFromState,
+          log: () => {},
+        });
+        if (hr.skipped) console.log(` up to date.`);
+        else console.log(` ${hr.historyRowsInserted} rows across ${hr.filesProcessed} changed file(s).`);
+      } catch (err) {
+        console.log(`\n  (symbol-history refresh skipped: ${(err as Error).message})`);
+      }
+    }
+  } finally {
+    store.close();
+  }
+}
+
+/** Build per-symbol git history for the wizard's "index history too?" opt-in. */
+async function performSymbolHistory(absRepo: string, dbPath: string): Promise<void> {
+  const store = new Store(dbPath);
+  try {
+    const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+    const { writeProgress, clearProgress } = await import('../indexer/progress.js');
+    console.log(`\n  Building per-symbol git history (this can take a while on large repos)...`);
+    const r = await buildSymbolHistory(absRepo, store, {
+      log: (m) => { clearProgress(); console.log(`  ${m}`); },
+      onProgress: (p) => {
+        if (process.stdout.isTTY) writeProgress(p.filesHandled, p.filesTotal, p.currentFile || p.phase);
+      },
+    });
+    clearProgress();
+    const partial = r.completed ? '' : ` — PARTIAL (${r.reason ?? 'budget reached'}); rerun \`seer symbol-history\` to resume`;
+    console.log(`  Symbol history: ${r.historyRowsInserted} rows across ${r.filesProcessed} files (${r.elapsedMs}ms)${partial}`);
+  } finally {
+    store.close();
+  }
+}
 
 //  seer init
 
 program
   .command('init [workspace]')
-  .description('Wire Seer in as an MCP server for your AI agents and write guidance files')
+  .description('Set up Seer as an MCP server for your AI agents (interactive) and write guidance files')
   .option('--db <path>', 'Custom database path passed through to the MCP launcher')
-  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all; all includes user-level clients (default: project-local clients)')
+  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (skips the wizard; "all" includes user-level clients)')
   .option('--auto', 'Workspace-local setup for supported clients; no user-level/global config')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
@@ -179,17 +227,36 @@ program
   .option('--no-agents', 'Do not write agent guidance files')
   .option('--print', 'Print the plan without writing any files')
   .option('--force', 'Overwrite an existing seer entry / agents block')
-  .action((workspace: string | undefined, opts: {
+  .option('-y, --yes', 'Skip the interactive wizard; accept detected defaults non-interactively')
+  .action(async (workspace: string | undefined, opts: {
     db?: string; client?: string; auto?: boolean; global?: boolean; npx?: boolean; pkg?: string;
-    command?: string; agents?: boolean; print?: boolean; force?: boolean;
+    command?: string; agents?: boolean; print?: boolean; force?: boolean; yes?: boolean;
   }) => {
     const ws = path.resolve(workspace ?? process.cwd());
     if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
 
-    const clients = parseClientList(opts.client);
+    let clients = parseClientList(opts.client);
+
+    // Interactive wizard: when a human is at the keyboard and hasn't already
+    // pinned the choice down with --client/--global/--print/--yes, ask which
+    // agents to set up instead of guessing. Guessing is what wrote .cursor/ and
+    // .vscode/ into Antigravity-only repos. The wizard also offers to index now.
+    let runIndexAfter = false;
+    let runHistoryAfter = false;
+    const wizardEligible = !opts.client && !opts.global && !opts.print && !opts.yes
+      && !opts.command && isInteractive();
+    if (wizardEligible) {
+      const answers = await runInitWizard(detectAutoClients(ws));
+      if (!answers) return; // user bailed out
+      clients = answers.clients;
+      runIndexAfter = answers.index;
+      runHistoryAfter = answers.symbolHistory;
+    }
 
     const result = runInit({
       workspace: ws,
+      // When the wizard ran it always returns a non-empty `clients`, so the
+      // `auto`/default fallback below is only consulted in non-interactive runs.
       clients,
       auto: opts.auto,
       global: opts.global,
@@ -226,11 +293,25 @@ program
       console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(28)} ${cf.file}`);
     }
 
+    // Run the wizard's opt-in index/history now, after config is written.
+    if (runIndexAfter && !opts.print) {
+      const dbPath = resolveDb(ws, opts.db);
+      try {
+        await performIndex(ws, dbPath, {});
+        if (runHistoryAfter) await performSymbolHistory(ws, dbPath);
+      } catch (err) {
+        console.log(`\n  (indexing skipped: ${(err as Error).message})`);
+      }
+    }
+
     console.log(`\n  Next:`);
-    console.log(`    1. From this repo, build the index now: npx seer-mcp index .`);
-    console.log(`       If you skip this, Seer builds it on the first MCP query.`);
-    console.log(`    2. Reload / restart your agent so it picks up the new MCP server.`);
-    console.log(`    3. Ask your agent to call seer_health to confirm it is connected.\n`);
+    let step = 1;
+    if (!runIndexAfter) {
+      console.log(`    ${step++}. From this repo, build the index now: npx seer-mcp index .`);
+      console.log(`       If you skip this, Seer builds it on the first MCP query.`);
+    }
+    console.log(`    ${step++}. Reload / restart your agent so it picks up the new MCP server.`);
+    console.log(`    ${step++}. Ask your agent to call seer_health to confirm it is connected.\n`);
   });
 
 // seer update
@@ -277,7 +358,7 @@ program
     }
 
     if (inferred.length === 0 && !result.agents && !(result.contextFiles ?? []).length) {
-      console.log(`  . No Seer install found here. Run "npx seer-mcp init --auto" from the repo.`);
+      console.log(`  . No Seer install found here. Run "npx seer-mcp init" from the repo.`);
     }
     if (opts.print) {
       console.log(`\n  (Dry run - run without --print to apply)\n`);
