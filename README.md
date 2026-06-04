@@ -4,7 +4,7 @@
 
 Give your AI agents a map of your repo before they edit.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 [![MCP](https://img.shields.io/badge/MCP-Enabled-brightgreen.svg)](docs/mcp.md)
 [![NodeJS](https://img.shields.io/badge/Node.js-%3E%3D_24-green.svg?logo=nodedotjs)](https://nodejs.org/)
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vladimirhegai/Seer-MCP/actions)
@@ -256,5 +256,5 @@ More detail: [Full Quick Start](docs/quickstart.md) and [MCP Setup](docs/mcp.md)
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full license text.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full license text.
 

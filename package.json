@@ -2,7 +2,7 @@
   "name": "seer-mcp",
   "version": "0.1.19",
   "description": "Give your AI agents a map of your repo before they edit.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "private": false,
   "type": "commonjs",
   "main": "dist/cli/index.js",
