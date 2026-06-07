@@ -7,6 +7,8 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
+import { computeCoupling } from '../indexer/coupling.js';
+import { attachCallSiteSnippets } from '../indexer/snippets.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectActiveClient, detectConfiguredClients, ClientId } from './init.js';
 import { runInitWizard, isInteractive } from './prompt.js';
 
@@ -435,10 +437,12 @@ program
   .option('--db <path>', 'Database path')
   .option('--file <path>', 'Disambiguate the target symbol by definition file')
   .option('-n, --limit <n>', 'Max results', '40')
+  .option('--include-snippets', 'Show the real source at each call site (HOW the symbol is invoked); pair with a small --limit')
+  .option('--snippet-context <n>', 'Lines of context around each call site with --include-snippets (default 2, max 6)', '2')
   // Callers query is keyed by `edges.to_name`, not by symbol_role / vendor /
   // test flags. The include-* options are accepted for surface consistency
   // with the rest of the CLI but don't currently change results.
-  .action((symbol: string, opts: { db?: string; file?: string; limit: string }) => {
+  .action((symbol: string, opts: { db?: string; file?: string; limit: string; includeSnippets?: boolean; snippetContext: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
     try {
@@ -460,9 +464,24 @@ program
       const callers = target ? store.findCallersById(target.id, limit) : store.findCallers(symbol, limit);
       const label = target ? `${target.qualifiedName ?? target.name} in ${target.filePath}` : symbol;
       console.log(`\nCallers of '${label}'  (${total} found)\n`);
-      for (const c of callers) {
-        const loc = `${c.callerFile}:${c.callerLine + 1}`;
-        console.log(`  ${c.callerName.padEnd(32)} ${c.callerKind.padEnd(12)} ${loc}`);
+      if (opts.includeSnippets) {
+        // Same shared slicer the MCP tool uses (indexer/snippets.ts) so the two
+        // surfaces never diverge. callerLine is the 0-indexed call row.
+        const ctx = parseInt(opts.snippetContext, 10);
+        const withSnips = attachCallSiteSnippets(
+          callers.map(c => ({ file: c.callerFile, line: c.callerLine, name: c.callerName, kind: c.callerKind })),
+          Number.isFinite(ctx) ? ctx : 2,
+        );
+        for (const c of withSnips) {
+          console.log(`  ${c.name}  (${c.kind})  ${c.file}:${c.line + 1}`);
+          if (c.snippet) for (const ln of c.snippet.split('\n')) console.log(`      ${ln}`);
+          console.log('');
+        }
+      } else {
+        for (const c of callers) {
+          const loc = `${c.callerFile}:${c.callerLine + 1}`;
+          console.log(`  ${c.callerName.padEnd(32)} ${c.callerKind.padEnd(12)} ${loc}`);
+        }
       }
       if (total > callers.length) console.log(`   and ${total - callers.length} more`);
     } finally { store.close(); }
@@ -938,6 +957,74 @@ program
           console.log(`     in:       ${r.previousFile}`);
         }
       }
+    } finally { store.close(); }
+  });
+
+//  seer changes-with (temporal/logical coupling)
+
+program
+  .command('changes-with <symbol>')
+  .description('Symbols that historically change in the same commits (advisory coupling; needs `seer symbol-history`).')
+  .option('--db <path>', 'Database path')
+  .option('--file <path>', 'Disambiguate the target symbol by definition file')
+  .option('-n, --limit <n>', 'Max partners', '20')
+  .option('--min-support <n>', 'Minimum shared commits for a partner (default 2)', '2')
+  .option('--max-commit-symbols <n>', 'Drop commits touching more than N distinct symbols as noise (default 50)', '50')
+  .option('--cross-file-only', 'Exclude partners in the same file (proximity coupling)')
+  .option('--since <when>', 'Lower bound on commit time: unix seconds or an ISO date (e.g. 2024-01-01)')
+  .option('--json', 'Emit raw JSON instead of a table')
+  .action((symbol: string, opts: {
+    db?: string; file?: string; limit: string; minSupport: string;
+    maxCommitSymbols: string; crossFileOnly?: boolean; since?: string; json?: boolean;
+  }) => {
+    const dbPath = opts.db ?? findDbFromCwd();
+    const store = openStore(dbPath);
+    try {
+      const target = store.getDefinition(symbol, { filePath: opts.file })[0] ?? null;
+      if (!target) { console.log(`No symbol "${symbol}"${opts.file ? ` in ${opts.file}` : ''}`); return; }
+
+      // since accepts unix-seconds or an ISO date.
+      let since: number | undefined;
+      if (opts.since) {
+        const raw = opts.since.trim();
+        since = /^\d+$/.test(raw) ? parseInt(raw, 10) : Math.floor(Date.parse(raw) / 1000);
+        if (!Number.isFinite(since)) { console.error(`Invalid --since value: ${opts.since}`); process.exit(1); }
+      }
+
+      const result = computeCoupling(store, target.id, {
+        limit: parseInt(opts.limit, 10) || 20,
+        minSupport: parseInt(opts.minSupport, 10) || 2,
+        maxCommitSymbols: parseInt(opts.maxCommitSymbols, 10) || 50,
+        includeSameFile: opts.crossFileOnly !== true,
+        since,
+      });
+
+      // Mirror the MCP gate exactly: coupling is only trustworthy against the
+      // FULL repo-wide history index (a partner's file must be indexed too). The
+      // full build is what stamps lastHistoryHeadSha; a scoped/auto build leaves
+      // it null, so warn rather than present partial data as authoritative.
+      const fullyBuilt = store.getHistoryIndexInfo().lastHistoryHeadSha != null;
+
+      if (opts.json) {
+        console.log(JSON.stringify({ symbol, file: opts.file, historyComplete: fullyBuilt, ...result }, null, 2));
+        return;
+      }
+
+      if (!fullyBuilt) {
+        console.log(`\n⚠ Symbol history is not FULLY built, so coupling is unreliable here (partial or falsely empty).`);
+        console.log(`  Coupling needs repo-wide history — run \`seer symbol-history\` first, then re-run.\n`);
+      }
+      console.log(`\nChanges-with '${target.qualifiedName ?? target.name}'  (${target.filePath}:${target.lineStart + 1})`);
+      console.log(`  target commits: ${result.targetCommits}, used: ${result.effectiveCommits}, noisy dropped: ${result.noisyCommitsIgnored}`);
+      if (result.partners.length === 0) { console.log(`  (no coupled partners)`); return; }
+      console.log('');
+      for (const p of result.partners) {
+        const conf = `${Math.round(p.confidence * 100)}%`;
+        const where = p.sameFile ? ' [same-file]' : '';
+        console.log(`  ${(p.symbol.qualifiedName ?? p.symbol.name).padEnd(36)} shared=${String(p.sharedCommits).padStart(3)}  conf=${conf.padStart(4)}  base=${p.partnerCommits}${where}`);
+        console.log(`      ${p.symbol.file}:${p.symbol.lineStart + 1}`);
+      }
+      console.log(`\n  Advisory: co-change is correlation, not causation. Verify a partner before trusting it.`);
     } finally { store.close(); }
   });
 

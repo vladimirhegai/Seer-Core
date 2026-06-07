@@ -92,6 +92,7 @@ npm run test:init          # the cross-agent installer
 npm run test:tracke        # modules, behavior, risk, context
 npm run test:trackg        # service links and protocols
 npm run test:tracki        # external bundles, contract diff, preflight, boundaries, continuity
+npm run test:coupling      # temporal coupling (seer_changes_with) + call-site snippets
 npm run test:regressions   # locked-in bug fixes
 ```
 

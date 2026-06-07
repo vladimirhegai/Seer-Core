@@ -22,9 +22,9 @@ realistic across machines.
 
 ---
 
-## Database schema (v10)
+## Database schema (v11)
 
-One file, `<repo>/.seer/graph.db`, with `CURRENT_SCHEMA_VERSION = 10`.
+One file, `<repo>/.seer/graph.db`, with `CURRENT_SCHEMA_VERSION = 11`.
 Migrations are idempotent and run automatically when the database is opened for
 writing, using `ALTER TABLE ADD COLUMN` and `CREATE TABLE IF NOT EXISTS` checks,
 so an old index upgrades in place.
@@ -43,6 +43,11 @@ Symbols carry a `symbol_role` (`definition`, `declaration`, or `type_ref`) and a
 `is_rankable` flag. Forward declarations and type references are stored but kept
 out of PageRank and hidden from default search, which is what keeps a 3-million-
 node C codebase from drowning in noise.
+
+`symbol_history_progress` (added in v11) stores per-file resume watermarks for
+the symbol-history build, keyed on `file_hash + options_fingerprint +
+algorithm_version`, so interrupted builds can restart without re-walking unchanged
+files across HEAD shifts.
 
 ---
 

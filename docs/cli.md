@@ -65,11 +65,14 @@ references are hidden. Opt in with the `--include-*` flags.
 
 ```bash
 seer callers <symbol> [--file path] [--limit n]  # who calls this
+seer callers <symbol> --include-snippets [--snippet-context n]  # + real source at each call site
 seer callees <symbol> [--limit n]    # what this calls
 ```
 
 Without `--file`, callers is intentionally broad for shared short names. Use
 `--file` for exact, id-scoped callers of a common or qualified method name.
+`--include-snippets` adds the real source at each call site (HOW the symbol is
+invoked — argument patterns); pair it with a small `--limit`.
 
 ---
 
@@ -108,7 +111,14 @@ seer churn                       # file-level git stats
 seer symbol-history [--force]    # build the per-symbol history index (opt-in)
 seer history <symbol>            # commit blame chain for one symbol
 seer continuity <symbol>         # rename/move continuity evidence (advisory)
+seer changes-with <symbol>       # symbols that historically co-change (advisory coupling)
 ```
+
+`changes-with` mines the per-symbol history for temporal coupling — the symbols
+that changed in the same commits as the target. It needs the FULL history index
+(`seer symbol-history`); on a scoped/partial index it prints a warning and may be
+incomplete. Flags: `--file`, `--min-support n`, `--max-commit-symbols n`,
+`--cross-file-only`, `--since <unix|ISO>`, `--json`.
 
 ---
 

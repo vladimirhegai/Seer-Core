@@ -2732,6 +2732,111 @@ export class Store {
     return toNum(row.c);
   }
 
+  /**
+   * Temporal / logical coupling for a symbol, mined PURELY from the existing
+   * `symbol_history` table (no new pass, no extra index — it works wherever
+   * symbol history is built). "Which symbols changed in the same commits as
+   * this one?" is the git-history wedge turned into an edit-impact signal: it
+   * catches coupling the static call graph cannot see (shared serialization
+   * formats, protocol constants, parallel implementations, config).
+   *
+   * Honest, advisory-only design:
+   *   - `maxCommitSymbols` drops huge sweeping commits (mass renames, formatting,
+   *     license headers): a commit touching more distinct symbols than the cap
+   *     couples everything to everything, so it is pure noise. Excluded commits
+   *     are reported as `noisyCommitsIgnored`.
+   *   - `support` = number of NON-NOISY commits where both symbols changed.
+   *   - `effectiveCommits` = non-noisy commits touching the target (the
+   *     denominator the caller uses for a conditional-probability confidence).
+   *   - `minSupport` filters one-off coincidences (default 2).
+   * Returns raw ids + counts; the caller resolves symbol metadata so the Store
+   * stays a pure data layer. Empty when history is not built.
+   */
+  coupledSymbols(symbolId: number, options: {
+    maxCommitSymbols?: number;
+    minSupport?: number;
+    limit?: number;
+    since?: number;
+  } = {}): {
+    targetCommits: number;
+    effectiveCommits: number;
+    noisyCommitsIgnored: number;
+    rows: Array<{ symbolId: number; support: number; partnerCommits: number }>;
+  } {
+    const empty = { targetCommits: 0, effectiveCommits: 0, noisyCommitsIgnored: 0, rows: [] };
+    if (!this.hasV4Tables) return empty;
+    const maxCommitSymbols = Math.max(2, options.maxCommitSymbols ?? 50);
+    const minSupport = Math.max(1, options.minSupport ?? 2);
+    const limit = Math.max(1, Math.min(options.limit ?? 20, 200));
+    const since = options.since;
+    const sinceClause = since != null ? 'AND committed_at >= ?' : '';
+
+    // Distinct commits that touched the target (within the optional time window).
+    const targetArgs: Array<number> = since != null ? [symbolId, since] : [symbolId];
+    const targetCommits = toNum((this.db.prepare(
+      `SELECT COUNT(DISTINCT commit_sha) AS c FROM symbol_history WHERE symbol_id = ? ${sinceClause}`,
+    ).get(...targetArgs) as Row).c);
+    if (targetCommits === 0) return empty;
+
+    // Of those, how many are non-noisy (breadth ≤ cap). breadth counts distinct
+    // symbols recorded against the commit anywhere in the index, so it reflects
+    // the real sweep size of the commit, not just its overlap with the target.
+    const effectiveCommits = toNum((this.db.prepare(`
+      WITH target_commits AS (
+        SELECT DISTINCT commit_sha FROM symbol_history WHERE symbol_id = ? ${sinceClause}
+      )
+      SELECT COUNT(*) AS c FROM (
+        SELECT sh.commit_sha
+        FROM symbol_history sh
+        JOIN target_commits tc ON tc.commit_sha = sh.commit_sha
+        GROUP BY sh.commit_sha
+        HAVING COUNT(DISTINCT sh.symbol_id) <= ?
+      )
+    `).get(...targetArgs, maxCommitSymbols) as Row).c);
+
+    // partnerCommits is the partner's BASE change rate. Window it with the same
+    // `since` as the target metrics — an all-time count next to windowed
+    // support/effectiveCommits would misrepresent the base rate (and the
+    // ORDER BY tie-break that uses it).
+    const partnerSinceClause = since != null ? 'AND p.committed_at >= ?' : '';
+    const rowArgs: Array<number> = [...targetArgs, maxCommitSymbols];
+    if (since != null) rowArgs.push(since); // for the partnerCommits subquery
+    rowArgs.push(symbolId, minSupport, limit);
+    const rows = this.db.prepare(`
+      WITH target_commits AS (
+        SELECT DISTINCT commit_sha FROM symbol_history WHERE symbol_id = ? ${sinceClause}
+      ),
+      good_commits AS (
+        SELECT sh.commit_sha
+        FROM symbol_history sh
+        JOIN target_commits tc ON tc.commit_sha = sh.commit_sha
+        GROUP BY sh.commit_sha
+        HAVING COUNT(DISTINCT sh.symbol_id) <= ?
+      )
+      SELECT sh.symbol_id AS symbolId,
+             COUNT(DISTINCT sh.commit_sha) AS support,
+             (SELECT COUNT(*) FROM symbol_history p WHERE p.symbol_id = sh.symbol_id ${partnerSinceClause}) AS partnerCommits
+      FROM symbol_history sh
+      JOIN good_commits gc ON gc.commit_sha = sh.commit_sha
+      WHERE sh.symbol_id <> ?
+      GROUP BY sh.symbol_id
+      HAVING support >= ?
+      ORDER BY support DESC, partnerCommits ASC, sh.symbol_id ASC
+      LIMIT ?
+    `).all(...rowArgs) as Row[];
+
+    return {
+      targetCommits,
+      effectiveCommits,
+      noisyCommitsIgnored: targetCommits - effectiveCommits,
+      rows: rows.map(r => ({
+        symbolId: toNum(r.symbolId),
+        support: toNum(r.support),
+        partnerCommits: toNum(r.partnerCommits),
+      })),
+    };
+  }
+
   getGitIndexState(): {
     repoRoot: string;
     lastHeadSha: string | null;

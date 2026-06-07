@@ -25,6 +25,8 @@ import { getContinuityForSymbol, buildContinuity } from '../indexer/continuity.j
 import { importScip } from '../scip/import.js';
 import { findDuplicates, buildShapeHashes } from '../indexer/shapehash.js';
 import { buildSkeleton } from '../indexer/skeleton.js';
+import { computeCoupling } from '../indexer/coupling.js';
+import { attachCallSiteSnippets } from '../indexer/snippets.js';
 
 /**
  * Seer MCP server.
@@ -1088,11 +1090,15 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound. To narrow that bound: includeNameMatches=true (raw list, pageable with nameMatchOffset), groupByFile=true (accurate per-file breakdown of where the by-name sites concentrate), and filterReceiverType (best-effort: keep only sites whose receiver is locally typed as a given class; true infers the class from the target).',
+      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. Pass includeSnippets=true to get the real source at each call site (HOW the symbol is invoked — argument patterns — before you write a new call). For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound. To narrow that bound: includeNameMatches=true (raw list, pageable with nameMatchOffset), groupByFile=true (accurate per-file breakdown of where the by-name sites concentrate), and filterReceiverType (best-effort: keep only sites whose receiver is locally typed as a given class; true infers the class from the target).',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
         limit: z.number().int().positive().max(500).optional(),
+        includeSnippets: z.boolean().optional()
+          .describe('Attach a bounded source snippet at each call site (real argument/usage patterns) to the resolved `items` list. Best paired with a small limit; snippets are counted against tokenBudget.'),
+        snippetContext: z.number().int().nonnegative().max(6).optional()
+          .describe('Lines of context above/below each call site in includeSnippets (default 2, max 6).'),
         includeNameMatches: z.boolean().optional()
           .describe('Also return callers matched by SHORT name (type-unresolved upper bound). Useful for C/C++ member calls where the precise id-resolved set undercounts.'),
         nameMatchOffset: z.number().int().nonnegative().max(1000000).optional()
@@ -1104,7 +1110,7 @@ export class SeerMcpServer {
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims the (already limit-bounded) caller list.'),
       },
-    }, async ({ symbol, file, limit, includeNameMatches, nameMatchOffset, groupByFile, filterReceiverType, tokenBudget }) => {
+    }, async ({ symbol, file, limit, includeNameMatches, nameMatchOffset, groupByFile, filterReceiverType, tokenBudget, includeSnippets, snippetContext }) => {
       await this.ensureFresh();
       // Resolve to a specific id when the input is DISAMBIGUATING: a `file` was
       // given, or the symbol is qualified (`Node.add_child` / `Node::add_child`).
@@ -1132,11 +1138,14 @@ export class SeerMcpServer {
       const rows = target
         ? this.store.findCallersById(target.id, limit ?? 40)
         : this.store.findCallers(symbol, limit ?? 40);
-      const items = rows.map(c => ({
+      const baseItems = rows.map(c => ({
         callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
         callerKind: c.callerKind, file: c.callerFile, line: c.callerLine,
         edgeKind: c.edgeKind,
       }));
+      const items = includeSnippets
+        ? attachCallSiteSnippets(baseItems, snippetContext ?? 2)
+        : baseItems;
       // Honest blast-radius bounds: when a resolved target's short name is shared
       // and far more call sites use the bare name than resolved here, report both.
       const ambiguity = target
@@ -1172,6 +1181,12 @@ export class SeerMcpServer {
           });
           if (includeNameMatches) {
             const nmOffset = Math.min(nameMatchOffset ?? 0, dedupedAll.length);
+            // No snippets here on purpose: the by-name page is attached to the
+            // base object, which budgetedText does NOT trim (it only trims the
+            // top-level `items`). Snippets on a large includeNameMatches page
+            // would escape tokenBudget entirely. Snippets stay on the resolved
+            // `items` list, which IS budget-counted. The by-name list is a
+            // counting/disambiguation aid, where call-site source adds little.
             const page = dedupedAll.slice(nmOffset, nmOffset + (limit ?? 40)).map(c => ({
               callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
               callerKind: c.callerKind, file: c.callerFile, line: c.callerLine, edgeKind: c.edgeKind,
@@ -2002,6 +2017,60 @@ export class SeerMcpServer {
         returned: items.length,
         results: items,
         ...(buildHint ? { buildHint } : {}),
+        note,
+      });
+    });
+
+    this.registerTool('seer_changes_with', {
+      description: 'Temporal coupling (advisory): which OTHER symbols have historically changed in the SAME commits as this one. Catches edit-impact the call graph cannot — shared formats, protocol constants, parallel impls, config. Each partner carries sharedCommits (co-change count) and a confidence (P(partner changes | this changes), 0..1). Huge sweeping commits are dropped as noise. Read-only: check historyComplete. When historyComplete is false, partners may be partial or falsely empty; run seer_symbol_history_build with no args for authoritative coupling. Pass file to disambiguate a common name.',
+      inputSchema: {
+        symbol: z.string(),
+        file: z.string().optional(),
+        limit: z.number().int().positive().max(100).optional().describe('Max coupled partners to return (default 20).'),
+        minSupport: z.number().int().positive().max(100).optional()
+          .describe('Minimum shared commits for a partner to count (default 2; raise to cut coincidences).'),
+        maxCommitSymbols: z.number().int().min(2).max(2000).optional()
+          .describe('Drop commits touching more than this many distinct symbols as noise (default 50). Lower it on repos with frequent sweeping refactors.'),
+        since: z.number().int().optional().describe('Unix-seconds lower bound on commit time.'),
+        includeSameFile: z.boolean().optional()
+          .describe('Include partners in the same file as the target (proximity coupling). Default true; set false for cross-file links only.'),
+      },
+    }, async ({ symbol, file, limit, minSupport, maxCommitSymbols, since, includeSameFile }) => {
+      await this.ensureFresh();
+      const historyIndex = this.historyIndexStatus();
+      const target = this.store.getDefinition(symbol, { filePath: file })[0] ?? null;
+      if (!target) {
+        const didYouMean = this.suggestSymbols(symbol);
+        return this.text({ symbol, file, found: false, partners: [], source: 'git-history',
+          historyIndex,
+          reason: `no symbol "${symbol}"${file ? ` in ${file}` : ''}`,
+          ...(didYouMean.length > 0 ? { didYouMean } : {}) });
+      }
+      const result = computeCoupling(this.store, target.id, {
+        limit, minSupport, maxCommitSymbols, since, includeSameFile,
+      });
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      // Coupling is only trustworthy against the FULL, repo-wide history index:
+      // a partner's file must be in symbol_history too, or it silently can't
+      // co-occur. historyIndex.built is too weak — it flips true as soon as a
+      // single scoped seer_history auto-build inserts ANY rows (with
+      // lastHistoryHeadSha still null), which would make partial/empty coupling
+      // look authoritative. The full build is the one that stamps
+      // lastHistoryHeadSha, so gate on that. (See store.getHistoryIndexInfo.)
+      const fullyBuilt = historyIndex.lastHistoryHeadSha != null;
+      const note = !fullyBuilt
+        ? 'Symbol history is not FULLY built, so coupling is unreliable here (it may be partial or falsely empty). Coupling needs REPO-WIDE history — each partner\'s file must be indexed too — so a single-file auto-build is not enough. Run `seer symbol-history` or seer_symbol_history_build with no args, then re-call.'
+        : result.targetCommits === 0
+          ? 'No built history overlaps this symbol\'s current line range (it may be new, or its file changed since the last full build).'
+          : 'Advisory: co-change is correlation, not causation. confidence = P(partner changes | this changes) over non-noisy commits. Verify a partner before trusting it.';
+      return this.text({
+        symbol, file,
+        historyIndex,
+        // Structured honesty flag so an agent can branch without parsing prose:
+        // when false, `partners` may be partial or empty regardless of content.
+        historyComplete: fullyBuilt,
+        ...result,
+        ...(nameAmbiguity ? { nameAmbiguity } : {}),
         note,
       });
     });

@@ -67,6 +67,41 @@ you can scan for a few hundred tokens.
 
 ---
 
+## Find the real argument patterns before writing a new call
+
+You are about to add a new call to `buildInvoice`. Instead of reading the source
+file, pull a few call sites with their surrounding context:
+
+```
+seer_callers { "symbol": "buildInvoice", "limit": 5, "includeSnippets": true, "snippetContext": 2 }
+```
+
+Each result includes the actual source lines around the call — real argument
+patterns, not just where the function is called. `snippetContext` controls how
+many lines above and below to include (default 2, max 6). Use a small `limit`;
+snippets are for sampling patterns, not reading all 80 call sites.
+
+---
+
+## Find what else tends to change alongside a symbol
+
+You are editing `serializeMessage` and want to know whether there are sibling
+symbols that have historically changed with it — shared format constants,
+parallel implementations, a companion deserializer — coupling that the call graph
+cannot see:
+
+```
+seer_changes_with { "symbol": "serializeMessage" }
+```
+
+The response lists partner symbols with `sharedCommits` (how many commits they
+co-changed in) and `confidence` (P(partner changed | target changed) over
+non-noisy commits). Check `historyComplete` first: when `false`, the full
+symbol-history index has not been built and partners may be partial or absent.
+Results are advisory and confidence-labeled — correlation, not causation.
+
+---
+
 ## Batch several lookups into one round-trip
 
 ```

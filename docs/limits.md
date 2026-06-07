@@ -45,6 +45,15 @@ were bound to a definition, which is naturally lower in repos that lean on
 external libraries (those targets are not in the index). It is a health signal,
 not a quality grade.
 
+## Temporal coupling requires a full history index
+
+`seer_changes_with` mines `symbol_history` for co-change partners. It needs the
+repo-wide history index — a partner's file must also be indexed, otherwise its
+coupling signal is invisible. Check `historyComplete` in the response: when
+`false`, the full index has not been built and `partners` may be partial or
+falsely empty. Build it with `npx seer-mcp symbol-history` (can take minutes on
+large repos). The tool never silently auto-builds a partial answer.
+
 ## Deterministic, not semantic
 
 Seer returns facts, not understanding. It will tell you a function has 9

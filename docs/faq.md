@@ -14,7 +14,10 @@ Codebase-memory and similar graph-first tools are great at structural
 exploration. Seer leans into edit-awareness: tests that cover a symbol, the risk
 of touching it, what a diff will break, and how a function changed over time.
 Think of structural exploration as the floor, and edit-impact context as the
-thing Seer adds on top.
+thing Seer adds on top. A concrete example is `seer_changes_with`: it mines git
+history for the symbols that *historically change together* with the one you are
+about to edit — coupling through shared formats, protocol constants, or config
+that the static call graph (what graph-first tools expose) simply cannot see.
 
 ## How is Seer different from Serena?
 

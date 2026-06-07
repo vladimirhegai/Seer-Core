@@ -20,6 +20,8 @@ inline.
 | Known symbol before reading or editing | `seer_context` or `seer_preflight` |
 | Common method name like `init`, `update`, `add_child` | `seer_context` / `seer_callers` with `file` |
 | Direct call graph | `seer_callers` or `seer_callees` |
+| About to write a NEW call to a function | `seer_callers` with `includeSnippets: true` |
+| What else tends to change with this symbol | `seer_changes_with` (needs full history) |
 | Large transitive graph | `seer_trace` with `mode: "summary"` or paged preview |
 | Large file shape | `seer_skeleton` before a full file read |
 | Literal strings, comments, docs, config values | `rg` or file reads after Seer |
@@ -48,9 +50,14 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_definition` (`name`, `file?`) exact definition lookup.
 - `seer_file_symbols` (`file`) symbols in a file, in line order.
 - `seer_callers` (`symbol`, `file?`, `includeNameMatches?`, `groupByFile?`,
-  `filterReceiverType?`, `nameMatchOffset?`) DIRECT callers. `total` is call SITES
+  `filterReceiverType?`, `nameMatchOffset?`, `includeSnippets?`, `snippetContext?`)
+  DIRECT callers. `total` is call SITES
   (edges); `uniqueCallers` is distinct caller functions. Use `file` or a qualified
-  `Class.method` to disambiguate. For C/C++ member calls the receiver type is
+  `Class.method` to disambiguate. Pass `includeSnippets: true` to get the real
+  source at each call site (`snippet` + `snippetRange`) — the fastest way to see
+  *how* a function is actually called (argument patterns) before you write a new
+  call. Best with a small `limit`; `snippetContext` sets the lines of context
+  (default 2, max 6). For C/C++ member calls the receiver type is
   unresolved, so the precise count can undercount; an `ambiguity` block reports
   the by-name upper bound. Narrow it: `groupByFile: true` (accurate per-file
   breakdown of where the by-name sites concentrate), `filterReceiverType` (a class
@@ -103,6 +110,18 @@ and it maps a git diff to the affected symbols and their blast radius.
   strictly read-only lookup (e.g. inside `seer_batch`). The FULL repo history
   index stays explicit (`seer_symbol_history_build` with no args / CLI).
 - `seer_continuity` (`symbol`) rename/move evidence (advisory, confidence-labeled).
+- `seer_changes_with` (`symbol`, `file?`, `minSupport?`, `maxCommitSymbols?`,
+  `includeSameFile?`, `since?`) temporal/logical coupling: the symbols that have
+  historically changed in the *same commits* as this one. Catches edit-impact the
+  call graph cannot see — shared serialization formats, protocol constants,
+  parallel implementations, config. Each partner carries `sharedCommits` and a
+  `confidence` (P(partner changes | this changes) over non-noisy commits); huge
+  sweeping commits are dropped as noise (`noisyCommitsIgnored`). Advisory and
+  confidence-labeled, never causal. Read-only: check `historyComplete`; when it
+  is false, `partners` may be partial or falsely empty. Build the FULL
+  symbol-history index (`seer symbol-history` / `seer_symbol_history_build`) for
+  authoritative coupling — a single-file auto-build is not enough, because a
+  partner's file must also be in the history index.
 
 ## Portability and precision
 
