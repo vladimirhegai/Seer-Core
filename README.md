@@ -130,10 +130,6 @@ Imagine asking your agent:
 Before editing chargeCard, use Seer to inspect the callers, tests, route exposure, and risk.
 ```
 
-> [!TIP]
-> Good Seer prompts start with **"Before editing..."**. That nudges the agent to
-> gather impact context first, then read or patch files.
-
 The agent can call:
 
 ```json
