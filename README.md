@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 [![MCP](https://img.shields.io/badge/MCP-ready-2ea043)](docs/mcp.md)
 [![Node](https://img.shields.io/badge/Node.js-%3E%3D_24-339933?logo=nodedotjs)](https://nodejs.org/)
-[![CI](https://img.shields.io/badge/CI-passing-2ea043)](https://github.com/vladimirhegai/Seer-MCP/actions)
+[![Tests](https://img.shields.io/badge/tests-documented-2ea043)](docs/testing.md)
 
 [Quick Start](docs/quickstart.md) |
 [Tool Guide](docs/tools.md) |
@@ -355,7 +355,7 @@ See [Benchmarks](docs/benchmarks.md) and [Raw Results](docs/benchmarks/raw-resul
 | Proof | Current number |
 |---|---:|
 | Top-level executable test programs | 45 |
-| Test files and fixtures | 102 |
+| Files under `tests/` | 154 |
 | MCP protocol checks | 339 |
 | Focused C++ regression checks | 87 |
 

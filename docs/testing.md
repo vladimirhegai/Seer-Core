@@ -16,7 +16,7 @@ production-sized repositories.
 | Count | Meaning |
 |---:|---|
 | 45 | top-level executable test programs in `tests/*.ts` |
-| 102 | test files and fixtures under `tests/` |
+| 154 | files under `tests/` |
 | 19 | release gates chained by `npm test` |
 | 11 | MCP protocol suites inside `npm run test:mcp` |
 | 339 | checks in the latest `npm run test:mcp` run |

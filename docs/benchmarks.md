@@ -30,7 +30,6 @@ shape matters more than the exact wall-clock time.
 
 ```bash
 npm run scale-test
-npm run scale-test -- --skip cbm
 ```
 
 The command writes:

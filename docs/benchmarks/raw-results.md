@@ -19,9 +19,6 @@ unchanged.
 | Platform | Windows |
 | Machine class | Consumer laptop |
 
-Codebase-Memory is excluded from the public comparison set because it is a
-self-validation fixture.
-
 ## Results
 
 <!-- indexing-table-begin -->
@@ -49,5 +46,4 @@ self-validation fixture.
 
 ```bash
 npm run scale-test
-npm run scale-test -- --skip cbm
 ```
